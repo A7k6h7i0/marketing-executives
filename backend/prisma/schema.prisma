@@ -1,0 +1,328 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  SUPER_ADMIN
+  REGIONAL_MANAGER
+  SALES_MANAGER
+  SALES_EXECUTIVE
+  TELECALLER
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  INCOMPLETE
+  ON_LEAVE
+}
+
+enum BreakType {
+  COFFEE
+  LUNCH
+  PERSONAL
+}
+
+enum BreakStatus {
+  ACTIVE
+  CLOSED
+  UNCLOSED
+}
+
+enum TrackingStartPoint {
+  HOME
+  FIRST_OUTLET
+}
+
+enum Grade {
+  A
+  B
+  C
+  D
+}
+
+enum SyncStatus {
+  SYNCED
+  PENDING
+  FAILED
+}
+
+enum IncidentType {
+  VEHICLE
+  MEDICAL
+  OUTLET_CLOSED
+  BLOCKED
+  OTHER
+}
+
+enum ResolutionStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  CONVERTED
+  DISMISSED
+}
+
+enum RouteStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+enum TelecallerLeadStatus {
+  NEW
+  CONTACTED
+  INTERESTED
+  FOLLOWUP
+  WON
+  LOST
+}
+
+enum CallDirection {
+  OUTBOUND
+  INBOUND
+}
+
+model User {
+  id                String            @id @default(uuid()) @db.Uuid
+  email             String            @unique
+  phone             String?           @unique
+  name              String?           @db.VarChar(120)
+  passwordHash      String
+  role              Role              @default(SALES_EXECUTIVE)
+  region            String?
+  status            String            @default("ACTIVE") // ACTIVE, INACTIVE, SUSPENDED
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+  attendances       Attendance[]
+  breaks            Break[]
+  gpsPings          GpsPing[]
+  plans             DailyPlan[]
+  visits            Visit[]
+  incidents         Incident[]        @relation("ReportingUser")
+  resolvedIncidents Incident[]        @relation("ResolvingManager")
+  leads             Lead[]
+  optimizedRoutes   OptimizedRoute[]
+  ratings           Rating[]          @relation("Reviewer")
+  telecallerLeads   TelecallerLead[]  @relation("TelecallerLeadOwner")
+  telecallerCalls   TelecallerCall[]  @relation("TelecallerAgent")
+
+  @@map("users")
+}
+
+model Attendance {
+  id                 String           @id @default(uuid()) @db.Uuid
+  userId             String           @db.Uuid
+  loginTime          DateTime         @default(now())
+  logoutTime         DateTime?
+  totalWorkingHours  Decimal?         @db.Decimal(4, 2)
+  attendanceStatus   AttendanceStatus @default(PRESENT)
+  deviceId           String           @db.VarChar(128)
+  user               User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("attendances")
+}
+
+model Break {
+  id                 String           @id @default(uuid()) @db.Uuid
+  userId             String           @db.Uuid
+  breakType          BreakType
+  breakStartTime     DateTime         @default(now())
+  breakEndTime       DateTime?
+  totalBreakDuration Int?             // in minutes
+  status             BreakStatus      @default(ACTIVE)
+  user               User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("breaks")
+}
+
+model GpsPing {
+  id                 String             @id @default(uuid()) @db.Uuid
+  userId             String             @db.Uuid
+  latitude           Decimal            @db.Decimal(9, 6)
+  longitude          Decimal            @db.Decimal(9, 6)
+  timestamp          DateTime           @default(now())
+  distanceFromPrev   Decimal            @db.Decimal(8, 3) // in KM
+  trackingStartPoint TrackingStartPoint
+  user               User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("gps_pings")
+}
+
+model Outlet {
+  id                String            @id @default(uuid()) @db.Uuid
+  name              String            @db.VarChar(200)
+  address           String            @db.Text
+  contactPhone      String?           @db.VarChar(30)
+  contactEmail      String?           @db.VarChar(150)
+  gpsLat            Decimal           @db.Decimal(9, 6)
+  gpsLng            Decimal           @db.Decimal(9, 6)
+  grade             Grade?
+  overallRating     Decimal?          @db.Decimal(3, 2)
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+  visits            Visit[]
+  ratings           Rating[]
+  convertedFromLead Lead?             @relation("ConvertedOutlet")
+
+  @@map("outlets")
+}
+
+model DailyPlan {
+  id              String            @id @default(uuid()) @db.Uuid
+  userId          String            @db.Uuid
+  routeId         String?           @db.Uuid
+  areaName        String            @db.VarChar(120)
+  plannedVisits   Int
+  completedVisits Int               @default(0)
+  planDate        DateTime          @db.Date
+  createdAt       DateTime          @default(now())
+  user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("daily_plans")
+}
+
+model Visit {
+  id              String            @id @default(uuid()) @db.Uuid
+  outletId        String            @db.Uuid
+  userId          String            @db.Uuid
+  checkinTime     DateTime          @default(now())
+  checkoutTime    DateTime?
+  gpsLat          Decimal           @db.Decimal(9, 6)
+  gpsLng          Decimal           @db.Decimal(9, 6)
+  selfieUrl       String            @db.VarChar(512)
+  productsOrdered Json?             // Array of {sku, qty, unit_price}
+  salesValue      Decimal           @default(0.00) @db.Decimal(12, 2)
+  remarks         String?           @db.VarChar(500)
+  syncStatus      SyncStatus        @default(SYNCED)
+  outlet          Outlet            @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("visits")
+}
+
+model Incident {
+  id               String           @id @default(uuid()) @db.Uuid
+  userId           String           @db.Uuid
+  incidentType     IncidentType
+  description      String           @db.Text
+  imageUrls        String[]
+  videoUrls        String[]
+  createdAt        DateTime         @default(now())
+  resolutionStatus ResolutionStatus @default(OPEN)
+  resolvedBy       String?          @db.Uuid
+  resolvedAt       DateTime?
+  user             User             @relation("ReportingUser", fields: [userId], references: [id], onDelete: Cascade)
+  manager          User?            @relation("ResolvingManager", fields: [resolvedBy], references: [id], onDelete: SetNull)
+
+  @@map("incidents")
+}
+
+model Lead {
+  id                String          @id @default(uuid()) @db.Uuid
+  userId            String          @db.Uuid
+  businessName      String          @db.VarChar(200)
+  businessCategory  String          @db.VarChar(100)
+  contactPhone      String?         @db.VarChar(30)
+  contactEmail      String?         @db.VarChar(150)
+  gpsLat            Decimal         @db.Decimal(9, 6)
+  gpsLng            Decimal         @db.Decimal(9, 6)
+  leadStatus        LeadStatus      @default(NEW)
+  convertedOutletId String?         @unique @db.Uuid
+  createdAt         DateTime        @default(now())
+  user              User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  convertedOutlet   Outlet?         @relation("ConvertedOutlet", fields: [convertedOutletId], references: [id], onDelete: SetNull)
+
+  @@map("leads")
+}
+
+model OptimizedRoute {
+  id                     String      @id @default(uuid()) @db.Uuid
+  userId                 String      @db.Uuid
+  totalStops             Int
+  estimatedDistanceKm    Decimal     @db.Decimal(8, 2)
+  estimatedTravelTimeMin Int
+  stopSequence           Json        // Ordered array of {outlet_id, eta, order}
+  generatedAt            DateTime    @default(now())
+  status                 RouteStatus @default(ACTIVE)
+  user                   User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("optimized_routes")
+}
+
+model Rating {
+  id                String          @id @default(uuid()) @db.Uuid
+  outletId          String          @db.Uuid
+  reviewerId        String          @db.Uuid
+  paymentScore      Int             @db.SmallInt
+  volumeScore       Int             @db.SmallInt
+  cooperationScore  Int             @db.SmallInt
+  consistencyScore  Int             @db.SmallInt
+  relationshipScore Int             @db.SmallInt
+  overallRating     Decimal         @db.Decimal(3, 2)
+  grade             Grade
+  reviewDate        DateTime        @db.Date
+  outlet            Outlet          @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  reviewer          User            @relation("Reviewer", fields: [reviewerId], references: [id], onDelete: Cascade)
+
+  @@map("ratings")
+}
+
+model TelecallerLead {
+  id           String               @id @default(uuid()) @db.Uuid
+  name         String               @db.VarChar(120)
+  phone        String               @db.VarChar(32)
+  company      String?              @db.VarChar(160)
+  email        String?              @db.VarChar(150)
+  status       TelecallerLeadStatus @default(NEW)
+  ownerId      String?              @db.Uuid
+  source       String?              @db.VarChar(120)
+  notes        String?              @db.Text
+  nextFollowAt DateTime?
+  assignedFor  DateTime?
+  tags         String[]
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+  owner        User?                @relation("TelecallerLeadOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  calls        TelecallerCall[]
+
+  @@index([ownerId, status])
+  @@index([ownerId, assignedFor])
+  @@index([phone])
+  @@map("telecaller_leads")
+}
+
+model TelecallerCall {
+  id             String         @id @default(uuid()) @db.Uuid
+  leadId         String?        @db.Uuid
+  agentId        String         @db.Uuid
+  direction      CallDirection  @default(OUTBOUND)
+  externalCallId String?        @unique @db.VarChar(120)
+  fromNumber     String?        @db.VarChar(32)
+  toNumber       String?        @db.VarChar(32)
+  status         String?        @db.VarChar(64)
+  durationSec    Int?
+  recordingUrl   String?        @db.VarChar(512)
+  startedAt      DateTime?
+  endedAt        DateTime?
+  notes          String?        @db.Text
+  createdAt      DateTime       @default(now())
+  lead           TelecallerLead?  @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  agent          User           @relation("TelecallerAgent", fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@index([agentId, createdAt])
+  @@index([leadId])
+  @@map("telecaller_calls")
+}
