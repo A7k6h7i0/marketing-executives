@@ -8,6 +8,9 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../../../core/network/app_provider.dart';
 import '../data/telecaller_api.dart';
+import '../data/telecaller_pending_call.dart';
+import '../data/telecaller_recording_setup.dart';
+import '../data/telecaller_recording_uploader.dart';
 
 const _leadStatuses = ['NEW', 'CONTACTED', 'INTERESTED', 'FOLLOWUP', 'WON', 'LOST'];
 const _statusFilters = ['ALL', ..._leadStatuses];
@@ -42,6 +45,9 @@ class _TelecallerScreenState extends State<TelecallerScreen> with WidgetsBinding
   String? _error;
   String? _pendingCallId;
   Map<String, dynamic>? _pendingCallLead;
+  DateTime? _callStartedAt;
+  bool _showingOutcomeSheet = false;
+  Timer? _resumeTimer;
 
   bool get _canManageLeads {
     final role = Provider.of<AppProvider>(context, listen: false).role ?? '';
@@ -55,6 +61,12 @@ class _TelecallerScreenState extends State<TelecallerScreen> with WidgetsBinding
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _fetch();
+    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+      unawaited(TelecallerPendingCall.clear());
+    } else {
+      WidgetsBinding.instance
+          .addPostFrameCallback((_) => _recoverPendingCall());
+    }
   }
 
   @override
@@ -62,14 +74,43 @@ class _TelecallerScreenState extends State<TelecallerScreen> with WidgetsBinding
     WidgetsBinding.instance.removeObserver(this);
     _search.dispose();
     _debounce?.cancel();
+    _resumeTimer?.cancel();
     super.dispose();
+  }
+
+  Future<void> _recoverPendingCall() async {
+    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+      await TelecallerPendingCall.clear();
+      return;
+    }
+    if (_pendingCallId != null || _showingOutcomeSheet) return;
+    final saved = await TelecallerPendingCall.load();
+    if (saved == null || !mounted) return;
+    _pendingCallId = saved.callId;
+    _pendingCallLead = saved.lead;
+    _callStartedAt = saved.startedAt;
+    await _showCallOutcomeSheet(includeRecordingStep: true);
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && _pendingCallId != null) {
-      _showCallOutcomeSheet();
+    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) return;
+    if (state == AppLifecycleState.resumed &&
+        _pendingCallId != null &&
+        !_showingOutcomeSheet) {
+      _resumeTimer?.cancel();
+      _resumeTimer = Timer(const Duration(milliseconds: 1500), () async {
+        if (!mounted) return;
+        await _showCallOutcomeSheet(includeRecordingStep: true);
+      });
     }
+  }
+
+  Future<void> _cleanupPendingCall() async {
+    _pendingCallId = null;
+    _pendingCallLead = null;
+    _callStartedAt = null;
+    await TelecallerPendingCall.clear();
   }
 
   Future<void> _fetch() async {
@@ -136,38 +177,60 @@ class _TelecallerScreenState extends State<TelecallerScreen> with WidgetsBinding
 
       _pendingCallId = callId;
       _pendingCallLead = lead;
+      _callStartedAt = DateTime.now();
 
-      final launched = await launchUrl(Uri(scheme: 'tel', path: phone), mode: LaunchMode.externalApplication);
+      await TelecallerPendingCall.save(
+        callId: callId,
+        lead: lead,
+        startedAt: _callStartedAt!,
+      );
+
+      final launched = await launchUrl(
+        Uri(scheme: 'tel', path: phone),
+        mode: LaunchMode.externalApplication,
+      );
       if (!launched) {
-        _pendingCallId = null;
-        _pendingCallLead = null;
+        await _cleanupPendingCall();
         throw Exception('Could not open phone app');
       }
-      _toast('Phone call opened');
+      await TelecallerRecordingSetup.load();
+      _toast(
+        TelecallerRecordingSetup.hasLinkedFolder
+            ? 'Phone call opened — we\'ll scan your recordings folder when you return'
+            : 'Phone call opened — log the outcome when you return',
+      );
     } catch (e) {
+      await _cleanupPendingCall();
       if (mounted) _toast(formatTelecallerError(e), isError: true);
     }
   }
 
-  Future<void> _showCallOutcomeSheet() async {
+  Future<void> _showCallOutcomeSheet({bool includeRecordingStep = false}) async {
     final callId = _pendingCallId;
     final lead = _pendingCallLead;
-    if (callId == null || lead == null) return;
+    if (callId == null || lead == null || _showingOutcomeSheet) return;
 
+    _showingOutcomeSheet = true;
     final saved = await showModalBottomSheet<bool>(
       context: context,
       isScrollControlled: true,
+      isDismissible: false,
+      enableDrag: false,
       builder: (ctx) => _CallOutcomeSheet(
+        api: _api,
+        callId: callId,
         leadName: lead['name']?.toString() ?? 'Lead',
+        callStartedAt: _callStartedAt,
+        runRecordingUpload: includeRecordingStep,
         onSave: (outcome, notes) async {
           await _api.updateCallOutcome(callId, outcome: outcome, notes: notes);
         },
       ),
     );
+    _showingOutcomeSheet = false;
 
     if (saved == true) {
-      _pendingCallId = null;
-      _pendingCallLead = null;
+      await _cleanupPendingCall();
       await _fetch();
     }
   }
@@ -949,8 +1012,20 @@ class _LeadStatusSheetState extends State<_LeadStatusSheet> {
 }
 
 class _CallOutcomeSheet extends StatefulWidget {
-  const _CallOutcomeSheet({required this.leadName, required this.onSave});
+  const _CallOutcomeSheet({
+    required this.api,
+    required this.callId,
+    required this.leadName,
+    required this.onSave,
+    this.callStartedAt,
+    this.runRecordingUpload = false,
+  });
+
+  final TelecallerApi api;
+  final String callId;
   final String leadName;
+  final DateTime? callStartedAt;
+  final bool runRecordingUpload;
   final Future<void> Function(String outcome, String? notes) onSave;
 
   @override
@@ -961,6 +1036,18 @@ class _CallOutcomeSheetState extends State<_CallOutcomeSheet> {
   String? _outcome;
   final _notes = TextEditingController();
   bool _saving = false;
+  RecordingProcessState _recordingState = const RecordingProcessState(
+    phase: RecordingProcessPhase.idle,
+  );
+  bool _recordingDone = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.runRecordingUpload) {
+      unawaited(_runRecordingUpload());
+    }
+  }
 
   @override
   void dispose() {
@@ -968,8 +1055,150 @@ class _CallOutcomeSheetState extends State<_CallOutcomeSheet> {
     super.dispose();
   }
 
+  Future<void> _runRecordingUpload() async {
+    final uploader = TelecallerRecordingUploader(widget.api);
+    await uploader.runAutoUpload(
+      callId: widget.callId,
+      callStartedAt: widget.callStartedAt,
+      onState: (state) {
+        if (!mounted) return;
+        setState(() {
+          _recordingState = state;
+          if (state.phase == RecordingProcessPhase.success ||
+              state.phase == RecordingProcessPhase.failed) {
+            _recordingDone = true;
+          }
+        });
+      },
+    );
+  }
+
+  Future<void> _pickRecordingManually() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: const [
+        'm4a',
+        'mp3',
+        'aac',
+        'wav',
+        'amr',
+        'mp4',
+        '3gp',
+        'ogg',
+        'opus',
+      ],
+    );
+    if (result == null || result.files.isEmpty) return;
+    final file = result.files.first;
+    final path = file.path;
+    if (path == null || path.isEmpty) return;
+
+    final uploader = TelecallerRecordingUploader(widget.api);
+    await uploader.uploadManualPick(
+      callId: widget.callId,
+      filePath: path,
+      fileName: file.name,
+      onState: (state) {
+        if (!mounted) return;
+        setState(() {
+          _recordingState = state;
+          if (state.phase == RecordingProcessPhase.success ||
+              state.phase == RecordingProcessPhase.failed) {
+            _recordingDone = true;
+          }
+        });
+      },
+    );
+  }
+
+  Widget _recordingBanner() {
+    if (!widget.runRecordingUpload) return const SizedBox.shrink();
+    final s = _recordingState;
+    final Color bg;
+    final IconData icon;
+    final String title;
+    switch (s.phase) {
+      case RecordingProcessPhase.scanning:
+        bg = const Color(0xFFDBEAFE);
+        icon = Icons.folder_open_rounded;
+        title = s.detail ?? 'Scanning recordings…';
+      case RecordingProcessPhase.uploading:
+        bg = const Color(0xFFFEF3C7);
+        icon = Icons.cloud_upload_rounded;
+        title = s.detail ?? 'Uploading…';
+      case RecordingProcessPhase.success:
+        bg = const Color(0xFFD1FAE5);
+        icon = Icons.check_circle_rounded;
+        title = s.detail ?? 'Recording uploaded';
+      case RecordingProcessPhase.failed:
+        bg = const Color(0xFFFEE2E2);
+        icon = Icons.error_outline_rounded;
+        title = s.error ?? 'Recording upload failed';
+      case RecordingProcessPhase.idle:
+        bg = const Color(0xFFDBEAFE);
+        icon = Icons.hourglass_top_rounded;
+        title = 'Preparing recording upload…';
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              if (s.phase == RecordingProcessPhase.scanning ||
+                  s.phase == RecordingProcessPhase.uploading ||
+                  s.phase == RecordingProcessPhase.idle)
+                const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              else
+                Icon(icon, size: 20),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  title,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
+            ],
+          ),
+          if (s.detail != null &&
+              s.phase == RecordingProcessPhase.failed) ...[
+            const SizedBox(height: 6),
+            Text(s.detail!, style: const TextStyle(fontSize: 13)),
+          ],
+          if (s.phase == RecordingProcessPhase.failed) ...[
+            const SizedBox(height: 8),
+            OutlinedButton(
+              onPressed: _pickRecordingManually,
+              child: const Text('Pick recording file'),
+            ),
+            TextButton(
+              onPressed: () => setState(() => _recordingDone = true),
+              child: const Text('Skip recording'),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final recordingBlocking = widget.runRecordingUpload &&
+        !_recordingDone &&
+        _recordingState.phase != RecordingProcessPhase.success &&
+        _recordingState.phase != RecordingProcessPhase.failed;
+
     return Padding(
       padding: EdgeInsets.only(
         left: 16,
@@ -977,49 +1206,67 @@ class _CallOutcomeSheetState extends State<_CallOutcomeSheet> {
         top: 16,
         bottom: MediaQuery.of(context).viewInsets.bottom + 16,
       ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Text('Call outcome — ${widget.leadName}',
-              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
-          const SizedBox(height: 8),
-          ..._callOutcomes.map(
-            (o) => RadioListTile<String>(
-              value: o,
-              groupValue: _outcome,
-              onChanged: (v) => setState(() => _outcome = v),
-              title: Text(o.replaceAll('_', ' ')),
-              dense: true,
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              widget.runRecordingUpload
+                  ? 'Call recording & outcome — ${widget.leadName}'
+                  : 'Call outcome — ${widget.leadName}',
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
             ),
-          ),
-          TextField(
-            controller: _notes,
-            decoration: const InputDecoration(labelText: 'Notes (optional)'),
-            maxLines: 2,
-          ),
-          const SizedBox(height: 12),
-          FilledButton(
-            onPressed: _saving || _outcome == null
-                ? null
-                : () async {
-                    setState(() => _saving = true);
-                    try {
-                      await widget.onSave(_outcome!, _notes.text.trim().isEmpty ? null : _notes.text.trim());
-                      if (mounted) Navigator.pop(context, true);
-                    } catch (e) {
-                      if (mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text(formatTelecallerError(e)), backgroundColor: Colors.red),
+            const SizedBox(height: 8),
+            _recordingBanner(),
+            ..._callOutcomes.map(
+              (o) => RadioListTile<String>(
+                value: o,
+                groupValue: _outcome,
+                onChanged: recordingBlocking
+                    ? null
+                    : (v) => setState(() => _outcome = v),
+                title: Text(o.replaceAll('_', ' ')),
+                dense: true,
+              ),
+            ),
+            TextField(
+              controller: _notes,
+              enabled: !recordingBlocking,
+              decoration: const InputDecoration(labelText: 'Notes (optional)'),
+              maxLines: 2,
+            ),
+            const SizedBox(height: 12),
+            FilledButton(
+              onPressed: _saving || _outcome == null || recordingBlocking
+                  ? null
+                  : () async {
+                      setState(() => _saving = true);
+                      try {
+                        await widget.onSave(
+                          _outcome!,
+                          _notes.text.trim().isEmpty
+                              ? null
+                              : _notes.text.trim(),
                         );
+                        if (mounted) Navigator.pop(context, true);
+                      } catch (e) {
+                        if (mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(formatTelecallerError(e)),
+                              backgroundColor: Colors.red,
+                            ),
+                          );
+                        }
+                      } finally {
+                        if (mounted) setState(() => _saving = false);
                       }
-                    } finally {
-                      if (mounted) setState(() => _saving = false);
-                    }
-                  },
-            child: const Text('Save outcome'),
-          ),
-        ],
+                    },
+              child: const Text('Save outcome'),
+            ),
+          ],
+        ),
       ),
     );
   }

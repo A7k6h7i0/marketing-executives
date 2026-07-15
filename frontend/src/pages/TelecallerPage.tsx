@@ -65,7 +65,6 @@ export default function TelecallerPage() {
     notes: '',
   });
   const [loading, setLoading] = useState(false);
-  const [calling, setCalling] = useState(false);
   const [saving, setSaving] = useState(false);
 
   async function fetchLeads() {
@@ -100,20 +99,11 @@ export default function TelecallerPage() {
     if (canManageLeads) fetchTelecallers();
   }, [canManageLeads]);
 
-  async function callLead(leadId: string) {
-    setCalling(true);
-    try {
-      await api.post(`/telecaller/leads/${leadId}/call`);
-      toast('Call initiated');
-      await fetchLeads();
-    } catch (err: unknown) {
-      toast(
-        (err as { response?: { data?: { error?: { message?: string } } } })?.response?.data?.error
-          ?.message || 'Could not start call',
-      );
-    } finally {
-      setCalling(false);
-    }
+  function callLead(_leadId: string) {
+    // Phone-dial + OEM recording upload runs on the Android telecaller app.
+    toast(
+      'Place calls from the Android telecaller app so recordings can upload automatically.',
+    );
   }
 
   async function createLead(e: FormEvent) {
@@ -327,10 +317,9 @@ export default function TelecallerPage() {
               <button
                 type="button"
                 className="btn btn--primary"
-                disabled={calling}
                 onClick={() => callLead(selected.id)}
               >
-                <Phone size={16} /> Click to call
+                <Phone size={16} /> Call via mobile app
               </button>
             </header>
 

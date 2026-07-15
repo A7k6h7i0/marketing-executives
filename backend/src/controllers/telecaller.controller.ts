@@ -1,3 +1,5 @@
+import fs from "fs/promises";
+import path from "path";
 import { Response } from "express";
 import { Role, TelecallerLeadStatus } from "@prisma/client";
 import { AuthenticatedRequest } from "../middlewares/auth";
@@ -152,7 +154,26 @@ export const updateCallOutcome = async (req: AuthenticatedRequest, res: Response
 export const attachCallRecording = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const user = await withAgentPhone(req);
-    const updated = await telecallerService.attachCallRecording(paramId(req.params.id), req.body, user);
+    let url = typeof req.body?.url === "string" ? req.body.url.trim() : "";
+
+    const file = req.file;
+    if (file?.buffer?.length) {
+      const uploadsDir = path.join(process.cwd(), "uploads", "call-recordings");
+      await fs.mkdir(uploadsDir, { recursive: true });
+      const ext = path.extname(file.originalname || "").toLowerCase() || ".m4a";
+      const safeExt = /^\.[a-z0-9]{1,8}$/.test(ext) ? ext : ".m4a";
+      const filename = `${paramId(req.params.id)}-${Date.now()}${safeExt}`;
+      await fs.writeFile(path.join(uploadsDir, filename), file.buffer);
+      url = `/uploads/call-recordings/${filename}`;
+    }
+
+    if (!url) throw new HttpError(400, "Recording file or url required");
+
+    const updated = await telecallerService.attachCallRecording(
+      paramId(req.params.id),
+      { url },
+      user
+    );
     res.json({ ok: true, recordingUrl: updated.recordingUrl });
   } catch (error) {
     handleError(res, error);

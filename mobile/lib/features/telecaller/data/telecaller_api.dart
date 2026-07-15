@@ -42,6 +42,26 @@ class TelecallerApi {
     return Map<String, dynamic>.from(response.data as Map);
   }
 
+  /// Upload a local OEM call recording and attach it to the call log.
+  Future<Map<String, dynamic>> attachCallRecordingFile({
+    required String callId,
+    required String filePath,
+    required String fileName,
+  }) async {
+    final form = FormData.fromMap({
+      'file': await MultipartFile.fromFile(filePath, filename: fileName),
+    });
+    final response = await _client.dio.post(
+      '${ApiEndpoints.telecallerCalls}/$callId/recording',
+      data: form,
+      options: Options(
+        sendTimeout: const Duration(minutes: 2),
+        receiveTimeout: const Duration(minutes: 2),
+      ),
+    );
+    return Map<String, dynamic>.from(response.data as Map);
+  }
+
   Future<Map<String, dynamic>> updateCallOutcome(
     String callId, {
     required String outcome,

@@ -21,6 +21,10 @@ import {
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+const recordingUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 },
+});
 
 const telecallerOrAdmin = authorizeRoles(
   Role.SUPER_ADMIN,
@@ -48,7 +52,12 @@ router.post(
 );
 router.get("/telecaller/calls", telecallerOrAdmin, listCalls);
 router.patch("/telecaller/calls/:id/outcome", telecallerOrAdmin, updateCallOutcome);
-router.post("/telecaller/calls/:id/recording", telecallerOrAdmin, attachCallRecording);
+router.post(
+  "/telecaller/calls/:id/recording",
+  telecallerOrAdmin,
+  recordingUpload.single("file"),
+  attachCallRecording
+);
 router.get("/telecaller/calls/daily-report.xlsx", telecallerAdmin, downloadDailyReport);
 router.get("/telecaller/followups/today", telecallerOrAdmin, followupsDueToday);
 router.get("/telecaller/users", telecallerAdmin, listTelecallers);

@@ -10,6 +10,7 @@ import 'package:uuid/uuid.dart';
 import 'api_client.dart';
 import '../constants/api_endpoints.dart';
 import '../database/database_helper.dart';
+import '../../features/telecaller/data/telecaller_recording_setup.dart';
 
 class AppProvider extends ChangeNotifier {
   final ApiClient _apiClient = ApiClient();
@@ -20,9 +21,12 @@ class AppProvider extends ChangeNotifier {
   String? _token;
   String? _userId;
   String? _email;
+  String? _phone;
   String? _role;
   String? _region;
   bool _isLoading = false;
+  bool _telecallerSetupLoaded = false;
+  bool _telecallerSetupComplete = false;
 
   // Attendance & Break State
   String? _activeAttendanceId;
@@ -201,8 +205,18 @@ class AppProvider extends ChangeNotifier {
   bool get isLoading => _isLoading;
   String? get userId => _userId;
   String? get email => _email;
+  String? get phone => _phone;
   String? get role => _role;
   String? get region => _region;
+  bool get telecallerSetupLoaded => _telecallerSetupLoaded;
+  bool get telecallerSetupComplete => _telecallerSetupComplete;
+
+  Future<void> reloadTelecallerSetup() async {
+    await TelecallerRecordingSetup.load();
+    _telecallerSetupComplete = TelecallerRecordingSetup.isComplete;
+    _telecallerSetupLoaded = true;
+    notifyListeners();
+  }
   String? get activeAttendanceId => _activeAttendanceId;
   String? get attendanceStatus => _attendanceStatus;
   DateTime? get attendanceCheckInAt => _attendanceStartAt;
@@ -246,9 +260,14 @@ class AppProvider extends ChangeNotifier {
     _token = prefs.getString('jwt_token');
     _userId = prefs.getString('user_id');
     _email = prefs.getString('user_email');
+    _phone = prefs.getString('user_phone');
     _role = prefs.getString('user_role');
     _region = prefs.getString('user_region');
     _minimumVisitDurationMinutes = prefs.getInt('minimum_visit_duration_minutes') ?? 2;
+
+    await TelecallerRecordingSetup.load();
+    _telecallerSetupComplete = TelecallerRecordingSetup.isComplete;
+    _telecallerSetupLoaded = true;
 
     if (_token != null && _token!.isNotEmpty) {
       _isAuthenticated = true;
@@ -294,6 +313,7 @@ class AppProvider extends ChangeNotifier {
         _token = nested?['access_token']?.toString() ?? body['token']?.toString();
         _userId = user?['id']?.toString();
         _email = user?['email']?.toString();
+        _phone = user?['phone']?.toString();
         _role = user?['role']?.toString();
         _region = user?['org_id']?.toString() ?? user?['region']?.toString();
         _activeAttendanceId = body['attendanceId']?.toString();
@@ -305,8 +325,13 @@ class AppProvider extends ChangeNotifier {
         await prefs.setString('jwt_token', _token!);
         await prefs.setString('user_id', _userId!);
         if (_email != null) await prefs.setString('user_email', _email!);
+        if (_phone != null) await prefs.setString('user_phone', _phone!);
         await prefs.setString('user_role', _role!);
         if (_region != null) await prefs.setString('user_region', _region!);
+
+        await TelecallerRecordingSetup.load();
+        _telecallerSetupComplete = TelecallerRecordingSetup.isComplete;
+        _telecallerSetupLoaded = true;
 
         _isAuthenticated = true;
         _isLoading = false;
@@ -314,7 +339,7 @@ class AppProvider extends ChangeNotifier {
 
         // Load today's role-specific data
         if (_role == 'TELECALLER') {
-          // Telecaller dashboard loads its own data
+          // Telecaller dashboard / onboarding loads its own data
         } else if (_role == 'SUPER_ADMIN' ||
             _role == 'REGIONAL_MANAGER' ||
             _role == 'SALES_MANAGER' ||
@@ -354,14 +379,39 @@ class AppProvider extends ChangeNotifier {
       print('Logout API failed (might be offline): $e');
     }
 
-    // Clear local session regardless of API success (failsafe)
+    // Clear local session regardless of API success (failsafe).
+    // Keep telecaller OEM folder link so agents do not re-onboard every login.
+    await TelecallerRecordingSetup.load();
+    final keepComplete = TelecallerRecordingSetup.isComplete;
+    final keepPath = TelecallerRecordingSetup.folderPath;
+    final keepLabel = TelecallerRecordingSetup.folderLabel;
+    final keepLastPath = TelecallerRecordingSetup.lastUploadedPath;
+    final keepLastMs = TelecallerRecordingSetup.lastUploadedModifiedMs;
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.clear();
+    await TelecallerRecordingSetup.reset();
+
+    if (keepPath != null && keepPath.isNotEmpty) {
+      await TelecallerRecordingSetup.setFolderPath(
+        path: keepPath,
+        displayName: keepLabel,
+      );
+    }
+    if (keepLastPath != null && keepLastMs != null) {
+      await TelecallerRecordingSetup.markLastUploaded(keepLastPath, keepLastMs);
+    }
+    if (keepComplete) {
+      await TelecallerRecordingSetup.markComplete();
+    }
+    _telecallerSetupComplete = TelecallerRecordingSetup.isComplete;
+    _telecallerSetupLoaded = true;
 
     _isAuthenticated = false;
     _token = null;
     _userId = null;
     _email = null;
+    _phone = null;
     _role = null;
     _region = null;
     _activeAttendanceId = null;

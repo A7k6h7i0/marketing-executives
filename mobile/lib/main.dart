@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 import 'core/network/app_provider.dart';
 import 'features/auth/presentation/login_screen.dart';
 import 'features/dashboard/presentation/dashboard_screen.dart';
+import 'features/telecaller/presentation/telecaller_onboarding_screen.dart';
 import 'features/telecaller/presentation/telecaller_screen.dart';
 
 void main() {
@@ -61,6 +62,18 @@ class AuthGate extends StatelessWidget {
     if (authProvider.isAuthenticated) {
       final role = authProvider.role ?? '';
       if (role == 'TELECALLER') {
+        if (!authProvider.telecallerSetupLoaded) {
+          return const Scaffold(
+            body: Center(child: CircularProgressIndicator()),
+          );
+        }
+        if (!authProvider.telecallerSetupComplete) {
+          return TelecallerOnboardingScreen(
+            onComplete: () {
+              authProvider.reloadTelecallerSetup();
+            },
+          );
+        }
         return const TelecallerDashboardScreen();
       }
       if (role == 'SUPER_ADMIN' ||
