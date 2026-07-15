@@ -36,6 +36,8 @@ function toast(message: string) {
 export default function TelecallerPage() {
   const user = getStoredUser();
   const canDownloadReports =
+    user?.role === 'admin' ||
+    user?.role === 'manager' ||
     user?.role === 'SUPER_ADMIN' ||
     user?.role === 'REGIONAL_MANAGER' ||
     user?.role === 'SALES_MANAGER';

@@ -4,8 +4,8 @@ import { login } from '../services/api';
 
 export default function LoginPage() {
   const navigate = useNavigate();
-  const [email, setEmail] = useState('admin@fieldforce.com');
-  const [password, setPassword] = useState('Password123!');
+  const [email, setEmail] = useState('admin@alpha.com');
+  const [password, setPassword] = useState('Test@1234');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -17,9 +17,12 @@ export default function LoginPage() {
       await login(email, password);
       navigate('/telecaller');
     } catch (err: unknown) {
+      const axiosErr = err as { response?: { data?: { error?: { message?: string } | string } } };
       const message =
-        (err as { response?: { data?: { error?: string } } })?.response?.data?.error ||
-        'Login failed';
+        axiosErr.response?.data?.error &&
+        typeof axiosErr.response.data.error === 'object'
+          ? axiosErr.response.data.error.message
+          : axiosErr.response?.data?.error || 'Login failed';
       setError(String(message));
     } finally {
       setLoading(false);

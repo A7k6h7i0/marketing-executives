@@ -6,6 +6,8 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../../../core/design/tokens.dart';
+import '../../../core/design/widgets.dart';
 import '../../../core/network/app_provider.dart';
 import '../data/telecaller_api.dart';
 import '../data/telecaller_pending_call.dart';
@@ -239,7 +241,7 @@ class _TelecallerScreenState extends State<TelecallerScreen> with WidgetsBinding
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(message),
-        backgroundColor: isError ? Colors.red.shade700 : const Color(0xFF1E3A8A),
+        backgroundColor: isError ? Colors.red.shade700 : BestieTokens.cBrand,
       ),
     );
   }
@@ -288,7 +290,7 @@ class _TelecallerScreenState extends State<TelecallerScreen> with WidgetsBinding
       'CONTACTED' => Colors.blue.shade800,
       'INTERESTED' || 'FOLLOWUP' => Colors.amber.shade900,
       'LOST' => Colors.grey.shade700,
-      _ => const Color(0xFF1E3A8A),
+      _ => BestieTokens.cBrand,
     };
   }
 
@@ -359,7 +361,7 @@ class _TelecallerScreenState extends State<TelecallerScreen> with WidgetsBinding
                 },
                 selectedColor: const Color(0xFFDBEAFE),
                 labelStyle: TextStyle(
-                  color: active ? const Color(0xFF1E3A8A) : Colors.grey.shade700,
+                  color: active ? BestieTokens.cBrand : Colors.grey.shade700,
                   fontWeight: FontWeight.w600,
                   fontSize: 11,
                 ),
@@ -566,7 +568,7 @@ class _TelecallerScreenState extends State<TelecallerScreen> with WidgetsBinding
                 backgroundColor: const Color(0xFFDBEAFE),
                 child: Text(
                   name.isNotEmpty ? name[0].toUpperCase() : '?',
-                  style: const TextStyle(color: Color(0xFF1E3A8A), fontWeight: FontWeight.bold),
+                  style: const TextStyle(color: BestieTokens.cBrand, fontWeight: FontWeight.bold),
                 ),
               ),
               title: Text(name, style: const TextStyle(fontWeight: FontWeight.w600)),
@@ -614,9 +616,10 @@ class TelecallerDashboardScreen extends StatelessWidget {
     final isWide = MediaQuery.sizeOf(context).width >= 900;
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF3F4F6),
-      appBar: AppBar(
-        title: const Text('Telecaller'),
+      backgroundColor: BestieTokens.cBg,
+      appBar: BestieShellAppBar(
+        showLogo: false,
+        title: 'Telecaller',
         actions: [
           if (provider.role == 'SUPER_ADMIN' ||
               provider.role == 'REGIONAL_MANAGER' ||

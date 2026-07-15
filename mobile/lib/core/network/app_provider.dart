@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:path_provider/path_provider.dart';
@@ -25,6 +26,7 @@ class AppProvider extends ChangeNotifier {
   String? _role;
   String? _region;
   bool _isLoading = false;
+  String? _loginError;
   bool _telecallerSetupLoaded = false;
   bool _telecallerSetupComplete = false;
 
@@ -203,6 +205,37 @@ class AppProvider extends ChangeNotifier {
   // Getters
   bool get isAuthenticated => _isAuthenticated;
   bool get isLoading => _isLoading;
+  String? get loginError => _loginError;
+
+  Map<String, dynamic> _mapFrom(dynamic value) {
+    if (value is Map<String, dynamic>) return value;
+    if (value is Map) return Map<String, dynamic>.from(value);
+    return {};
+  }
+
+  String _messageFromApiError(dynamic data) {
+    final body = _mapFrom(data);
+    final error = _mapFrom(body['error']);
+    return error['message']?.toString() ?? body['message']?.toString() ?? '';
+  }
+
+  String _loginFailureMessage(DioException error) {
+    final status = error.response?.statusCode;
+    final apiMessage = _messageFromApiError(error.response?.data);
+
+    if (status == 401) {
+      return apiMessage.isNotEmpty ? apiMessage : 'Invalid email or password.';
+    }
+    if (status == 500) {
+      return 'Production server error (500). The login API is down — ask your friend to check the server.';
+    }
+    if (error.type == DioExceptionType.connectionError ||
+        error.type == DioExceptionType.connectionTimeout) {
+      return 'Cannot reach ${ApiEndpoints.baseUrl}. Check your internet connection.';
+    }
+    if (apiMessage.isNotEmpty) return apiMessage;
+    return error.message ?? 'Login failed. Please try again.';
+  }
   String? get userId => _userId;
   String? get email => _email;
   String? get phone => _phone;
@@ -273,7 +306,11 @@ class AppProvider extends ChangeNotifier {
       _isAuthenticated = true;
       notifyListeners();
       
-      if (_role == 'admin' || _role == 'manager') {
+      if (_role == 'admin' ||
+          _role == 'manager' ||
+          _role == 'SUPER_ADMIN' ||
+          _role == 'REGIONAL_MANAGER' ||
+          _role == 'SALES_MANAGER') {
         fetchAdminDashboardData();
       } else {
         await _restoreTodayPlanFromLocal();
@@ -292,34 +329,37 @@ class AppProvider extends ChangeNotifier {
   // 1. Authentication Methods
   Future<bool> login(String emailOrPhone, String password, String deviceId) async {
     _isLoading = true;
+    _loginError = null;
     notifyListeners();
 
     try {
       final isEmail = emailOrPhone.contains('@');
       final data = {
-        if (isEmail) 'email': emailOrPhone else 'phone': emailOrPhone,
+        if (isEmail) 'email': emailOrPhone.trim() else 'phone': emailOrPhone.trim(),
         'password': password,
-        'deviceId': deviceId,
       };
 
       final response = await _apiClient.post(ApiEndpoints.login, data: data);
 
       if (response.statusCode == 200) {
         final prefs = await SharedPreferences.getInstance();
-        final body = response.data as Map<String, dynamic>;
-        final nested = body['data'] as Map<String, dynamic>?;
-        final user = nested?['user'] as Map<String, dynamic>? ?? body['user'] as Map<String, dynamic>?;
+        final body = _mapFrom(response.data);
+        final nested = _mapFrom(body['data']);
+        final user = _mapFrom(nested['user']);
+        if (user.isEmpty) {
+          user.addAll(_mapFrom(body['user']));
+        }
 
-        _token = nested?['access_token']?.toString() ?? body['token']?.toString();
-        _userId = user?['id']?.toString();
-        _email = user?['email']?.toString();
-        _phone = user?['phone']?.toString();
-        _role = user?['role']?.toString();
-        _region = user?['org_id']?.toString() ?? user?['region']?.toString();
+        _token = nested['access_token']?.toString() ?? body['token']?.toString();
+        _userId = user['id']?.toString();
+        _email = user['email']?.toString();
+        _phone = user['phone']?.toString();
+        _role = user['role']?.toString();
+        _region = user['org_id']?.toString() ?? user['region']?.toString();
         _activeAttendanceId = body['attendanceId']?.toString();
 
         if (_token == null || _userId == null || _role == null) {
-          throw Exception('Invalid login response');
+          throw Exception('Invalid login response from server');
         }
 
         await prefs.setString('jwt_token', _token!);
@@ -346,7 +386,7 @@ class AppProvider extends ChangeNotifier {
             _role == 'admin' ||
             _role == 'manager') {
           fetchAdminDashboardData();
-        } else {
+        } else if (_role == 'executive' || _role == 'SALES_EXECUTIVE') {
           fetchTodayLiveSummary();
           fetchTodayPlan();
           fetchProductCatalog();
@@ -356,8 +396,14 @@ class AppProvider extends ChangeNotifier {
 
         return true;
       }
+
+      _loginError = 'Unexpected server response (${response.statusCode}).';
+    } on DioException catch (e) {
+      _loginError = _loginFailureMessage(e);
+      print('Login failed: $_loginError');
     } catch (e) {
-      print('Login failed: $e');
+      _loginError = e.toString().replaceFirst('Exception: ', '');
+      print('Login failed: $_loginError');
     }
 
     _isLoading = false;
@@ -374,7 +420,7 @@ class AppProvider extends ChangeNotifier {
     }
 
     try {
-      await _apiClient.post(ApiEndpoints.logout, data: {'deviceId': deviceId});
+      await _apiClient.post(ApiEndpoints.logout);
     } catch (e) {
       print('Logout API failed (might be offline): $e');
     }
@@ -630,6 +676,14 @@ class AppProvider extends ChangeNotifier {
         fetchTodayLiveSummary();
         return true;
       }
+    } on DioException catch (e) {
+      if (e.response?.statusCode == 409) {
+        _attendanceEndAt = null;
+        _startAttendanceClock(DateTime.now().toUtc());
+        fetchTodayLiveSummary();
+        return true;
+      }
+      print('Check in failed: ${e.response?.data ?? e.message}');
     } catch (e) {
       print('Check in failed: $e');
     }
@@ -715,16 +769,40 @@ class AppProvider extends ChangeNotifier {
   }
 
   // 3. Route & Daily Plan Management
+  Map<String, dynamic> _normalizeOutlet(Map<String, dynamic> outlet) {
+    return {
+      'id': outlet['id'],
+      'name': outlet['name'] ?? outlet['outlet_name'] ?? 'Outlet',
+      'address': outlet['address'] ?? outlet['outlet_address'] ?? '',
+      'latitude': outlet['latitude'] ?? outlet['gps_lat'] ?? outlet['lat'],
+      'longitude': outlet['longitude'] ?? outlet['gps_lng'] ?? outlet['lng'],
+      'grade': outlet['grade'],
+      'overallRating': outlet['overall_rating'] ?? outlet['overallRating'],
+      'visitStatus': outlet['visit_status'] ?? outlet['visitStatus'] ?? 'PENDING',
+    };
+  }
+
+  Future<Map<String, dynamic>?> _pullSyncData() async {
+    final response = await _apiClient.post(ApiEndpoints.syncPull, data: {
+      'last_synced_at': '2020-01-01T00:00:00Z',
+    });
+    if (response.statusCode == 200) {
+      return Map<String, dynamic>.from(response.data['data'] ?? {});
+    }
+    return null;
+  }
+
   Future<void> fetchTodayPlan() async {
     try {
-      final response = await _apiClient.post(ApiEndpoints.syncPull, data: {
-        'last_synced_at': '2020-01-01T00:00:00Z',
-      });
-      if (response.statusCode == 200) {
-        final data = response.data['data'];
-        final outletsList = data != null ? (data['outlets'] as List<dynamic>? ?? []) : [];
-        
-        if (outletsList.isNotEmpty) {
+      final data = await _pullSyncData();
+      if (data == null) return;
+
+      final outletsList = (data['outlets'] as List<dynamic>? ?? [])
+          .whereType<Map>()
+          .map((o) => _normalizeOutlet(Map<String, dynamic>.from(o)))
+          .toList();
+
+      if (outletsList.isNotEmpty) {
           _routeOutlets = outletsList;
           _plannedOutlets = outletsList;
           _plannedVisitsCount = outletsList.length;
@@ -747,7 +825,6 @@ class AppProvider extends ChangeNotifier {
           await restoreActiveVisitFromLocalDb();
           startAutoVisitMonitoring();
           notifyListeners();
-        }
       }
     } catch (e) {
       print('Fetch today plan failed: $e. Retaining local plan state if active.');
@@ -811,10 +888,21 @@ class AppProvider extends ChangeNotifier {
     final serverRoutes = <dynamic>[];
 
     try {
-      final response = await _apiClient.get(ApiEndpoints.routes);
-      if (response.statusCode == 200) {
-        final data = response.data['data'] as List<dynamic>? ?? [];
-        serverRoutes.addAll(data);
+      final data = await _pullSyncData();
+      final routes = data?['routes'] as List<dynamic>? ?? [];
+      serverRoutes.addAll(routes);
+
+      final outlets = (data?['outlets'] as List<dynamic>? ?? [])
+          .whereType<Map>()
+          .map((o) => _normalizeOutlet(Map<String, dynamic>.from(o)))
+          .toList();
+      if (outlets.isNotEmpty && serverRoutes.isEmpty) {
+        serverRoutes.add({
+          'id': 'route-sync-default',
+          'name': 'Assigned Route',
+          'region': _region ?? 'Territory',
+          'outlets': outlets,
+        });
       }
     } catch (e) {
       print('Fetch routes failed: $e. Showing saved custom routes only.');
@@ -836,25 +924,11 @@ class AppProvider extends ChangeNotifier {
       orElse: () => null,
     );
 
-    // 1. Backend routes can still be saved remotely. Custom routes stay local.
+    // Production assigns outlets via sync/pull — refresh server data when available.
     if (selectedRoute is Map && selectedRoute['isManual'] != true) {
-      try {
-        final response = await _apiClient.post(ApiEndpoints.dailyPlans, data: {
-          'routeId': routeId,
-          'areaName': areaName,
-          'plannedVisits': plannedVisits,
-        });
-
-        if (response.statusCode == 200 || response.statusCode == 201) {
-          await fetchTodayPlan();
-          return true;
-        }
-      } catch (e) {
-        print('Save daily plan on server failed or endpoint not present: $e. Activating local plan.');
-      }
+      await fetchTodayPlan();
     }
 
-    // 2. Hybrid/Offline fallback: Save plan state locally so that the entire app workflow runs flawlessly
     _todayPlan = {
       'id': 'plan-${_uuid.v4()}',
       'route_id': routeId,
@@ -1698,14 +1772,10 @@ class AppProvider extends ChangeNotifier {
   // 7. Smart Lead Generation — potential new shops to convert into outlets
   Future<void> findNearbyLeads(double lat, double lng, String category) async {
     try {
+      final query = category.trim().length >= 2 ? category.trim() : 'shop';
       final response = await _apiClient.get(
-        ApiEndpoints.nearbyLeads,
-        queryParameters: {
-          'latitude': lat,
-          'longitude': lng,
-          'category': category,
-          'radiusMeters': 1000,
-        },
+        ApiEndpoints.searchOutlets,
+        queryParameters: {'q': query},
       );
       if (response.statusCode == 200) {
         final rawList = response.data['data'] as List<dynamic>? ?? [];
@@ -2090,9 +2160,30 @@ class AppProvider extends ChangeNotifier {
 
   Future<void> fetchAdminLiveVisitsList() async {
     try {
-      // Fetch live visit actions from the local SQLite DB database!
-      // This is a powerful, elegant dual-mode feature: If an executive logs checking-in / orders/ checkout,
-      // the manager immediately sees those real logs!
+      if (_role == 'admin' || _role == 'manager' || _role == 'SUPER_ADMIN' || _role == 'REGIONAL_MANAGER' || _role == 'SALES_MANAGER') {
+        final response = await _apiClient.get(ApiEndpoints.visits);
+        if (response.statusCode == 200) {
+          final rawList = response.data['data'] as List<dynamic>? ?? [];
+          _adminLiveVisitsList = rawList.map((v) {
+            final visit = Map<String, dynamic>.from(v as Map);
+            return {
+              'id': visit['id'],
+              'outletName': visit['outlet_name'] ?? visit['outletName'] ?? 'Outlet',
+              'outletAddress': visit['outlet_address'] ?? visit['outletAddress'] ?? '',
+              'checkInTime': visit['check_in_at'] ?? visit['checkin_time'] ?? visit['checkInTime'],
+              'checkOutTime': visit['check_out_at'] ?? visit['checkout_time'] ?? visit['checkOutTime'],
+              'salesValue': double.tryParse(visit['sales_value']?.toString() ?? visit['order_value']?.toString() ?? '0') ?? 0.0,
+              'remarks': visit['remarks'] ?? visit['notes'] ?? '',
+              'gpsLat': visit['gps_lat'] ?? visit['latitude'],
+              'gpsLng': visit['gps_lng'] ?? visit['longitude'],
+            };
+          }).toList();
+          notifyListeners();
+          return;
+        }
+      }
+
+      // Fallback: local SQLite visits for offline/demo mode
       final localVisits = await DatabaseHelper.instance.queryAll('offline_visits');
       
       final mappedVisits = localVisits.map((v) {
@@ -2142,6 +2233,27 @@ class AppProvider extends ChangeNotifier {
 
   Future<void> fetchAdminLiveGpsList() async {
     try {
+      if (_role == 'admin' || _role == 'manager' || _role == 'SUPER_ADMIN' || _role == 'REGIONAL_MANAGER' || _role == 'SALES_MANAGER') {
+        final response = await _apiClient.get(ApiEndpoints.gpsLive);
+        if (response.statusCode == 200) {
+          final rawList = response.data['data'] as List<dynamic>? ?? [];
+          _adminLiveGpsList = rawList.map((ping) {
+            final item = Map<String, dynamic>.from(ping as Map);
+            return {
+              'id': item['id'],
+              'latitude': item['latitude'],
+              'longitude': item['longitude'],
+              'address': item['address'],
+              'timestamp': item['logged_at'] ?? item['created_at'],
+              'startPoint': item['tracking_start_point'],
+              'userId': item['user_id'],
+            };
+          }).toList();
+          notifyListeners();
+          return;
+        }
+      }
+
       final localGps = await DatabaseHelper.instance.queryAll('offline_gps_pings');
       _adminLiveGpsList = localGps.map((ping) {
         return {

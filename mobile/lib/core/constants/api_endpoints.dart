@@ -1,53 +1,71 @@
 class ApiEndpoints {
-  // Local backend — change for production deployment
-  static const String baseUrl = 'http://localhost:5000';
+  static const String baseUrl = 'https://sales.digitalleadpro.com';
+  static const String apiPrefix = '/api/v1';
 
-  // Auth endpoints
-  static const String login = '/auth/login';
-  static const String logout = '/auth/logout';
-  static const String register = '/auth/register';
+  // Auth
+  static const String login = '$apiPrefix/auth/login';
+  static const String logout = '$apiPrefix/auth/logout';
+  static const String authMe = '$apiPrefix/auth/me';
 
-  // Attendance & Breaks
-  static const String attendanceHistory = '/attendance';
-  static const String startBreak = '/breaks/start';
-  static const String endBreak = '/breaks';
-  static const String todayBreaks = '/breaks';
+  // Attendance
+  static const String checkIn = '$apiPrefix/attendance/check-in';
+  static const String attendanceMy = '$apiPrefix/attendance/my';
+  static const String attendanceToday = '$apiPrefix/attendance/today';
+  static const String attendance = '$apiPrefix/attendance';
 
-  // GPS & Odometer Tracking
-  static const String gpsPing = '/gps/ping';
-  static const String gpsHistory = '/gps/route';
+  // GPS
+  static const String gpsLog = '$apiPrefix/gps/log';
+  static const String gpsBulk = '$apiPrefix/gps/bulk';
+  static const String gpsHistory = '$apiPrefix/gps/my/history';
+  static const String gpsLive = '$apiPrefix/gps/live';
 
-  // Plans & Routes
-  static const String routes = '/routes';
-  static const String dailyPlans = '/plans';
+  // Sync
+  static const String syncStatus = '$apiPrefix/sync/status';
+  static const String syncPull = '$apiPrefix/sync/pull';
+  static const String syncPush = '$apiPrefix/sync/push';
 
-  // Visits & Catalog
-  static const String productCatalog = '/products';
-  static const String checkin = '/visits/checkin';
-  static const String placeOrder = '/visits';
-  static const String checkout = '/visits';
+  // Search
+  static const String search = '$apiPrefix/search';
+  static const String searchOutlets = '$apiPrefix/search/outlets';
 
-  // Incidents
-  static const String incidents = '/incidents';
+  // Products & master data
+  static const String products = '$apiPrefix/products';
 
-  // Field-force Leads
-  static const String nearbyLeads = '/leads/nearby';
-  static const String saveLead = '/leads';
-  static const String getLeads = '/leads';
+  // Leads
+  static const String leads = '$apiPrefix/leads';
 
-  // Route Optimization
-  static const String optimizeRoute = '/routes/optimize';
+  // Visits & orders
+  static const String visits = '$apiPrefix/visits';
+  static const String orders = '$apiPrefix/orders';
 
-  // Admin Oversight endpoints
-  static const String adminKpis = '/admin/kpis';
-  static const String adminUsers = '/admin/users';
+  // Admin & manager
+  static const String users = '$apiPrefix/users';
+  static const String adminStats = '$apiPrefix/admin/stats';
+  static const String adminOrg = '$apiPrefix/admin/org';
+  static const String adminSettings = '$apiPrefix/admin/settings';
+  static const String analyticsDashboard = '$apiPrefix/analytics/dashboard';
+  static const String reportsDailySummary = '$apiPrefix/reports/daily-summary';
+  static const String approvalsPending = '$apiPrefix/approvals/pending';
 
-  // Telecaller CRM
-  static const String telecallerLeads = '/telecaller/leads';
-  static const String telecallerCalls = '/telecaller/calls';
-  static const String telecallerUsers = '/telecaller/users';
-  static const String telecallerBulkDistribute = '/telecaller/leads/bulk-distribute';
-  static const String telecallerBulkDistributeFile = '/telecaller/leads/bulk-distribute-file';
-  static const String telecallerDailyReport = '/telecaller/calls/daily-report.xlsx';
-  static const String telecallerFollowups = '/telecaller/followups/today';
+  // Notifications
+  static const String notificationsUnread = '$apiPrefix/notifications/unread-count';
+  static const String notificationsMarkRead = '$apiPrefix/notifications/mark-all-read';
+
+  // Telecaller (not on production API — kept for local/dev fallback)
+  static const String telecallerLeads = '$apiPrefix/telecaller/leads';
+  static const String telecallerCalls = '$apiPrefix/telecaller/calls';
+  static const String telecallerUsers = '$apiPrefix/telecaller/users';
+  static const String telecallerBulkDistribute = '$apiPrefix/telecaller/leads/bulk-distribute';
+  static const String telecallerBulkDistributeFile = '$apiPrefix/telecaller/leads/bulk-distribute-file';
+  static const String telecallerDailyReport = '$apiPrefix/telecaller/calls/daily-report.xlsx';
+  static const String telecallerFollowups = '$apiPrefix/telecaller/followups/today';
+
+  // Legacy aliases used by app_provider
+  static const String attendanceHistory = attendanceMy;
+  static const String gpsPing = gpsLog;
+  static const String productCatalog = products;
+  static const String saveLead = leads;
+  static const String getLeads = leads;
+  static const String nearbyLeads = searchOutlets;
+  static const String routes = syncPull;
 }

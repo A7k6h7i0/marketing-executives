@@ -9,6 +9,7 @@ class ApiClient {
     _dio.options.baseUrl = ApiEndpoints.baseUrl;
     _dio.options.connectTimeout = const Duration(seconds: 15);
     _dio.options.receiveTimeout = const Duration(seconds: 15);
+    _dio.options.headers = {'Content-Type': 'application/json'};
 
     // Add interceptor to automatically attach JWT token and log requests
     _dio.interceptors.add(

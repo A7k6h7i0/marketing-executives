@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../../../core/design/tokens.dart';
 import '../../../core/network/app_provider.dart';
 import '../data/telecaller_recording_setup.dart';
 
@@ -66,7 +67,7 @@ class _TelecallerOnboardingScreenState extends State<TelecallerOnboardingScreen>
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(msg),
-        backgroundColor: error ? Colors.red.shade700 : const Color(0xFF1E3A8A),
+        backgroundColor: error ? Colors.red.shade700 : BestieTokens.cBrand,
       ),
     );
   }
@@ -119,7 +120,7 @@ class _TelecallerOnboardingScreenState extends State<TelecallerOnboardingScreen>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFF2F7FB),
+      backgroundColor: BestieTokens.cBg,
       appBar: AppBar(
         title: Text('Setup · ${_step + 1} of 3'),
         automaticallyImplyLeading: _step > 0,
@@ -210,8 +211,7 @@ class _TelecallerOnboardingScreenState extends State<TelecallerOnboardingScreen>
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Icon(Icons.check_circle_outline,
-                    size: 18, color: Color(0xFF1E3A8A)),
+                const Icon(Icons.check_circle_outline, size: 18, color: BestieTokens.cBrand),
                 const SizedBox(width: 8),
                 Expanded(child: Text(t)),
               ],

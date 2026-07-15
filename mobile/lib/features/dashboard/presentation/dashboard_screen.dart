@@ -1,6 +1,9 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import '../../../core/design/shell.dart';
+import '../../../core/design/tokens.dart';
+import '../../../core/design/widgets.dart';
 import '../../../core/network/app_provider.dart';
 import 'package:intl/intl.dart';
 import 'package:image_picker/image_picker.dart';
@@ -78,34 +81,52 @@ class _DashboardScreenState extends State<DashboardScreen> {
     ];
 
     return Scaffold(
-      appBar: AppBar(
-        title: Text(_currentIndex == 0
-            ? 'Executive Home'
-            : _currentIndex == 1
-                ? 'Route & Tracking'
-                : _currentIndex == 2
-                    ? 'New Customer Prospects'
-                    : 'Field Reports'),
-        actions: [
-          // Synchronize button
-          IconButton(
-            icon: const Icon(Icons.sync),
-            tooltip: 'Sync Offline Data',
-            onPressed: () async {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Synchronizing offline logs...')),
-              );
-              await appProvider.syncOfflineData();
-            },
-          ),
-          // Logout button
-          IconButton(
-            icon: const Icon(Icons.logout),
-            tooltip: 'Logout',
-            onPressed: () => appProvider.logout('mock-device-fingerprint-123456'),
-          ),
-        ],
-      ),
+      backgroundColor: BestieTokens.cBg,
+      extendBody: true,
+      appBar: _currentIndex == 0
+          ? BestieShellAppBar(
+              actions: [
+                IconButton(
+                  icon: const Icon(Icons.sync),
+                  tooltip: 'Sync Offline Data',
+                  onPressed: () async {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Synchronizing offline logs...')),
+                    );
+                    await appProvider.syncOfflineData();
+                  },
+                ),
+                IconButton(
+                  icon: const Icon(Icons.logout),
+                  tooltip: 'Logout',
+                  onPressed: () => appProvider.logout('mock-device-fingerprint-123456'),
+                ),
+              ],
+            )
+          : AppBar(
+              title: Text(_currentIndex == 1
+                  ? 'Route & Tracking'
+                  : _currentIndex == 2
+                      ? 'New Customer Prospects'
+                      : 'Field Reports'),
+              actions: [
+                IconButton(
+                  icon: const Icon(Icons.sync),
+                  tooltip: 'Sync Offline Data',
+                  onPressed: () async {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Synchronizing offline logs...')),
+                    );
+                    await appProvider.syncOfflineData();
+                  },
+                ),
+                IconButton(
+                  icon: const Icon(Icons.logout),
+                  tooltip: 'Logout',
+                  onPressed: () => appProvider.logout('mock-device-fingerprint-123456'),
+                ),
+              ],
+            ),
       body: Stack(
         children: [
           tabs[_currentIndex],
@@ -116,7 +137,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               right: 16,
               bottom: 16,
               child: FloatingActionButton.extended(
-                backgroundColor: appProvider.activeBreak != null ? Colors.red : const Color(0xFFF59E0B),
+                backgroundColor: appProvider.activeBreak != null ? BestieTokens.cDanger : BestieTokens.cWarning,
                 foregroundColor: Colors.white,
                 icon: Icon(appProvider.activeBreak != null ? Icons.pause_circle_filled : Icons.free_breakfast),
                 label: Text(appProvider.activeBreak != null ? 'End Break' : 'Take Break'),
@@ -131,37 +152,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
             ),
         ],
       ),
-      bottomNavigationBar: BottomNavigationBar(
+      bottomNavigationBar: BestieBottomNav(
         currentIndex: _currentIndex,
         onTap: (index) {
           setState(() {
             _currentIndex = index;
           });
         },
-        type: BottomNavigationBarType.fixed,
-        selectedItemColor: const Color(0xFF1E3A8A),
-        unselectedItemColor: Colors.grey,
         items: const [
-          BottomNavigationBarItem(
-            icon: Icon(Icons.dashboard_outlined),
-            activeIcon: Icon(Icons.dashboard),
-            label: 'Home',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.map_outlined),
-            activeIcon: Icon(Icons.map),
-            label: 'Route',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.explore_outlined),
-            activeIcon: Icon(Icons.explore),
-            label: 'Prospects',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.report_problem_outlined),
-            activeIcon: Icon(Icons.report_problem),
-            label: 'Reports',
-          ),
+          BestieNavItem(Icons.dashboard_outlined, Icons.dashboard, 'Home'),
+          BestieNavItem(Icons.map_outlined, Icons.map, 'Route'),
+          BestieNavItem(Icons.explore_outlined, Icons.explore, 'Prospects'),
+          BestieNavItem(Icons.report_problem_outlined, Icons.report_problem, 'Reports'),
         ],
       ),
     );
@@ -182,7 +184,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             children: [
               const Text(
                 'Select Break Category',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A)),
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: BestieTokens.cBrand),
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 16),
@@ -332,7 +334,7 @@ void showOrderCatalogScreen(BuildContext context, AppProvider provider) {
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  const Text('Products Used / Order & Remarks', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A)), textAlign: TextAlign.center),
+                  const Text('Products Used / Order & Remarks', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: BestieTokens.cBrand), textAlign: TextAlign.center),
                   const SizedBox(height: 16),
                   const Text('SELECT PRODUCTS THIS CUSTOMER USES OR ORDERS', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.grey)),
                   const SizedBox(height: 4),
@@ -356,7 +358,7 @@ void showOrderCatalogScreen(BuildContext context, AppProvider provider) {
                           title: Text(prod['name'] ?? 'Test Product SKU', style: const TextStyle(fontWeight: FontWeight.bold)),
                           subtitle: Text('SKU: ${prod['sku']} - \$${displayPrice.toStringAsFixed(2)}'),
                           trailing: IconButton(
-                            icon: const Icon(Icons.add_circle, color: Color(0xFF1E3A8A), size: 20),
+                            icon: const Icon(Icons.add_circle, color: BestieTokens.cBrand, size: 20),
                             onPressed: () {
                               provider.addProductToOrder(prod['sku'] ?? 'SKU-GEN', prod['name'] ?? 'Test Product', 1, displayPrice);
                               setModalState(() {});
@@ -415,7 +417,7 @@ void showOrderCatalogScreen(BuildContext context, AppProvider provider) {
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
                       const Text('Order Grand Total:', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                      Text('\$${provider.currentOrderTotal.toStringAsFixed(2)}', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A))),
+                      Text('\$${provider.currentOrderTotal.toStringAsFixed(2)}', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: BestieTokens.cBrand)),
                     ],
                   ),
                   const SizedBox(height: 16),
@@ -483,6 +485,13 @@ void showOrderCatalogScreen(BuildContext context, AppProvider provider) {
   );
 }
 
+String _homeGreetingPrefix() {
+  final hour = DateTime.now().hour;
+  if (hour < 12) return 'Good morning';
+  if (hour < 17) return 'Good afternoon';
+  return 'Good evening';
+}
+
 class HomeTab extends StatelessWidget {
   const HomeTab({super.key});
 
@@ -492,18 +501,57 @@ class HomeTab extends StatelessWidget {
     final isWorking = appProvider.attendanceStatus == 'LOGGED_IN' || appProvider.attendanceStatus == 'PRESENT';
     final hasCheckedOut = appProvider.attendanceCheckOutAt != null;
 
+    final displayName = appProvider.email?.split('@').first ?? 'Executive';
+
     return SingleChildScrollView(
-      padding: const EdgeInsets.only(bottom: 80), // extra padding for global break button
+      padding: const EdgeInsets.only(bottom: 96),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // 1. Attendance & Hours Card (Real-time tracking, Module 1 & 2)
-          Card(
-            color: const Color(0xFF1E3A8A),
-            child: Padding(
-              padding: const EdgeInsets.all(20.0),
-              child: Column(
-                children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(BestieTokens.s4, BestieTokens.s4, BestieTokens.s4, 0),
+            child: Row(
+              children: [
+                CircleAvatar(
+                  radius: 22,
+                  backgroundColor: BestieTokens.cBrandSoft,
+                  child: Text(
+                    displayName.substring(0, 1).toUpperCase(),
+                    style: const TextStyle(color: BestieTokens.cBrandStrong, fontWeight: BestieTokens.fwBold),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(_homeGreetingPrefix(), style: const TextStyle(color: BestieTokens.cTextMuted, fontSize: 12)),
+                      Text(displayName, style: const TextStyle(fontSize: 20, fontWeight: BestieTokens.fwBold)),
+                    ],
+                  ),
+                ),
+                Container(
+                  width: 10,
+                  height: 10,
+                  decoration: BoxDecoration(
+                    color: isWorking ? BestieTokens.cSuccess : BestieTokens.cTextFaint,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: BestieTokens.s3),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: BestieTokens.s4),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(BestieTokens.rLg),
+              child: Container(
+                decoration: const BoxDecoration(gradient: BestieTokens.gBrand),
+                child: Padding(
+                  padding: const EdgeInsets.all(20.0),
+                  child: Column(
+                    children: [
                   Text(
                     isWorking
                         ? 'ACTIVE SESSION'
@@ -591,72 +639,83 @@ class HomeTab extends StatelessWidget {
                       label: const Text('END DAY / CHECK OUT'),
                     ),
                   ],
-                ],
+                    ],
+                  ),
+                ),
               ),
             ),
           ),
 
           // 2. Progress Bar (Module 4)
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16.0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('Today\'s Route Progress', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A))),
-                  const SizedBox(height: 8),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text('Visits: ${appProvider.completedVisitsCount} / ${appProvider.plannedVisitsCount}'),
-                      Text('${appProvider.planProgressPercentage.toStringAsFixed(1)}%'),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  LinearProgressIndicator(
-                    value: appProvider.planProgressPercentage / 100.0,
-                    minHeight: 12,
-                    borderRadius: BorderRadius.circular(6),
-                    backgroundColor: Colors.grey[200],
-                    valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF1E3A8A)),
-                  ),
-                ],
+          Padding(
+            padding: const EdgeInsets.fromLTRB(BestieTokens.s4, BestieTokens.s3, BestieTokens.s4, 0),
+            child: Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Today\'s Route Progress', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: BestieTokens.cBrand)),
+                    const SizedBox(height: 8),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text('Visits: ${appProvider.completedVisitsCount} / ${appProvider.plannedVisitsCount}'),
+                        Text('${appProvider.planProgressPercentage.toStringAsFixed(1)}%'),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    LinearProgressIndicator(
+                      value: appProvider.planProgressPercentage / 100.0,
+                      minHeight: 12,
+                      borderRadius: BorderRadius.circular(6),
+                      backgroundColor: Colors.grey[200],
+                      valueColor: const AlwaysStoppedAnimation<Color>(BestieTokens.cBrand),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
 
           if (appProvider.todayPlan != null && appProvider.activeVisit == null)
-            Card(
-              color: Colors.green.shade50,
-              child: ListTile(
-                leading: Icon(Icons.gps_fixed, color: Colors.green.shade700),
-                title: const Text('Auto visit monitoring active', style: TextStyle(fontWeight: FontWeight.bold)),
-                subtitle: Text(
-                  'Stay within 100m of an outlet for ${appProvider.minimumVisitDurationMinutes} min to auto-register a visit.',
+            Padding(
+              padding: const EdgeInsets.fromLTRB(BestieTokens.s4, BestieTokens.s3, BestieTokens.s4, 0),
+              child: Card(
+                color: Colors.green.shade50,
+                child: ListTile(
+                  leading: Icon(Icons.gps_fixed, color: Colors.green.shade700),
+                  title: const Text('Auto visit monitoring active', style: TextStyle(fontWeight: FontWeight.bold)),
+                  subtitle: Text(
+                    'Stay within 100m of an outlet for ${appProvider.minimumVisitDurationMinutes} min to auto-register a visit.',
+                  ),
                 ),
               ),
             ),
 
           // 3. Daily Area Selector (If no plan active, Module 4)
           if (appProvider.todayPlan == null)
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16.0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Configure Your Day', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A))),
-                    const SizedBox(height: 8),
-                    const Text('Choose an assigned route territory to load your target outlets checklist.'),
-                    const SizedBox(height: 16),
-                    ElevatedButton.icon(
-                      icon: const Icon(Icons.add_road),
-                      label: const Text('SELECT TODAY\'S ROUTE AREA'),
-                      onPressed: () {
-                        _showAreaPlanningSheet(context, appProvider);
-                      },
-                    ),
-                  ],
+            Padding(
+              padding: const EdgeInsets.fromLTRB(BestieTokens.s4, BestieTokens.s3, BestieTokens.s4, 0),
+              child: Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('Configure Your Day', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: BestieTokens.cBrand)),
+                      const SizedBox(height: 8),
+                      const Text('Choose an assigned route territory to load your target outlets checklist.'),
+                      const SizedBox(height: 16),
+                      ElevatedButton.icon(
+                        icon: const Icon(Icons.add_road),
+                        label: const Text('SELECT TODAY\'S ROUTE AREA'),
+                        onPressed: () {
+                          _showAreaPlanningSheet(context, appProvider);
+                        },
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -688,7 +747,7 @@ class HomeTab extends StatelessWidget {
                 color: isCompleted ? Colors.green[50] : Colors.white,
                 child: ListTile(
                   leading: CircleAvatar(
-                    backgroundColor: isCompleted ? Colors.green : const Color(0xFF1E3A8A),
+                    backgroundColor: isCompleted ? Colors.green : BestieTokens.cBrand,
                     foregroundColor: Colors.white,
                     child: Icon(isCompleted ? Icons.check : Icons.store),
                   ),
@@ -784,7 +843,7 @@ class HomeTab extends StatelessWidget {
             children: [
               const Text(
                 'Select Planned Territory Route',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A)),
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: BestieTokens.cBrand),
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 16),
@@ -809,7 +868,7 @@ class HomeTab extends StatelessWidget {
               ...provider.availableRoutes.map((route) {
                 final outlets = route['outlets'] as List<dynamic>? ?? [];
                 return ListTile(
-                  leading: const Icon(Icons.map, color: Color(0xFF1E3A8A)),
+                  leading: const Icon(Icons.map, color: BestieTokens.cBrand),
                   title: Text(route['name']),
                   subtitle: Text('Region: ${route['region']} • Outlets: ${outlets.length}'),
                   onTap: () async {
@@ -852,7 +911,7 @@ class HomeTab extends StatelessWidget {
               children: [
                 const Text(
                   'Add Custom Route / Area',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A)),
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: BestieTokens.cBrand),
                   textAlign: TextAlign.center,
                 ),
                 const SizedBox(height: 16),
@@ -983,7 +1042,7 @@ class HomeTab extends StatelessWidget {
               children: [
                 const Text(
                   'Add Outlet to Today\'s Plan',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A)),
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: BestieTokens.cBrand),
                   textAlign: TextAlign.center,
                 ),
                 const SizedBox(height: 16),
@@ -1139,7 +1198,7 @@ class HomeTab extends StatelessWidget {
                         const SizedBox(height: 4),
                         Text(latest['remarks']?.toString().isNotEmpty == true ? latest['remarks'] : 'No remarks added.'),
                         const SizedBox(height: 6),
-                        Text('Products: $productText', style: const TextStyle(fontSize: 12, color: Color(0xFF1E3A8A))),
+                        Text('Products: $productText', style: const TextStyle(fontSize: 12, color: BestieTokens.cBrand)),
                       ],
                     ),
                   );
@@ -1486,7 +1545,7 @@ class _MapTrackingTabState extends State<MapTrackingTab> {
                   Column(
                     children: [
                       const Text('Total Distance', style: TextStyle(color: Colors.grey)),
-                      Text('${appProvider.totalDistanceCoveredKm.toStringAsFixed(2)} KM', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A))),
+                      Text('${appProvider.totalDistanceCoveredKm.toStringAsFixed(2)} KM', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: BestieTokens.cBrand)),
                     ],
                   ),
                   const SizedBox(height: 40, child: VerticalDivider()),
@@ -1534,7 +1593,7 @@ class _MapTrackingTabState extends State<MapTrackingTab> {
                           polylines: [
                             Polyline(
                               points: polylinePoints,
-                              color: const Color(0xFF1E3A8A),
+                              color: BestieTokens.cBrand,
                               strokeWidth: 4,
                             ),
                           ],
@@ -1565,7 +1624,7 @@ class _MapTrackingTabState extends State<MapTrackingTab> {
                     child: FloatingActionButton.small(
                       heroTag: 'route-map-location',
                       backgroundColor: Colors.white,
-                      foregroundColor: const Color(0xFF1E3A8A),
+                      foregroundColor: BestieTokens.cBrand,
                       onPressed: _currentPosition == null
                           ? _loadCurrentPosition
                           : () => _mapController.move(_currentPosition!, 16),
@@ -1922,7 +1981,7 @@ class _LeadsTabState extends State<LeadsTab> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('What are Prospects?', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A))),
+                  Text('What are Prospects?', style: TextStyle(fontWeight: FontWeight.bold, color: BestieTokens.cBrand)),
                   SizedBox(height: 6),
                   Text(
                     'These are new shops or businesses near you that are NOT yet in your route. '
@@ -1963,7 +2022,7 @@ class _LeadsTabState extends State<LeadsTab> {
               IconButton(
                 icon: _isSearching
                     ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
-                    : const Icon(Icons.gps_fixed, color: Color(0xFF1E3A8A)),
+                    : const Icon(Icons.gps_fixed, color: BestieTokens.cBrand),
                 onPressed: _isSearching ? null : () => _searchNearbyLeads(appProvider),
               ),
             ],
@@ -2015,7 +2074,7 @@ class _LeadsTabState extends State<LeadsTab> {
                           title: Text(lead['businessName']),
                           subtitle: Text('Distance: ${lead['distanceMeters']}m | Category: ${lead['businessCategory']}'),
                           trailing: IconButton(
-                            icon: const Icon(Icons.bookmark_add_outlined, color: Color(0xFF1E3A8A)),
+                            icon: const Icon(Icons.bookmark_add_outlined, color: BestieTokens.cBrand),
                             tooltip: 'Save as Lead',
                             onPressed: () async {
                               final success = await appProvider.saveLeadRecord(
@@ -2144,7 +2203,7 @@ class _IncidentsTabState extends State<IncidentsTab> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('What are Field Reports?', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A))),
+                  Text('What are Field Reports?', style: TextStyle(fontWeight: FontWeight.bold, color: BestieTokens.cBrand)),
                   SizedBox(height: 6),
                   Text(
                     'Use this to report problems during your field day — vehicle breakdown, medical issue, '
@@ -2165,7 +2224,7 @@ class _IncidentsTabState extends State<IncidentsTab> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text('Report a Field Problem', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A))),
+                    const Text('Report a Field Problem', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: BestieTokens.cBrand)),
                     const SizedBox(height: 12),
                     
                     // Category dropdown
@@ -2365,71 +2424,68 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
     ];
 
     return Scaffold(
-      appBar: AppBar(
-        title: Text(_currentIndex == 0
-            ? 'Manager Command Center'
-            : _currentIndex == 1
-                ? 'Field Force Directory'
-                : _currentIndex == 2
-                    ? 'Field Activity Audit'
-                    : _currentIndex == 3
-                        ? 'Incident Oversight'
-                        : 'Telecaller Leads'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            tooltip: 'Refresh Analytics',
-            onPressed: () async {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Refreshing management metrics...')),
-              );
-              await appProvider.fetchAdminDashboardData();
-            },
-          ),
-          IconButton(
-            icon: const Icon(Icons.logout),
-            tooltip: 'Logout',
-            onPressed: () => appProvider.logout('mock-device-fingerprint-123456'),
-          ),
-        ],
-      ),
+      backgroundColor: BestieTokens.cBg,
+      extendBody: true,
+      appBar: _currentIndex == 0
+          ? BestieShellAppBar(
+              actions: [
+                IconButton(
+                  icon: const Icon(Icons.refresh),
+                  tooltip: 'Refresh Analytics',
+                  onPressed: () async {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Refreshing management metrics...')),
+                    );
+                    await appProvider.fetchAdminDashboardData();
+                  },
+                ),
+                IconButton(
+                  icon: const Icon(Icons.logout),
+                  tooltip: 'Logout',
+                  onPressed: () => appProvider.logout('mock-device-fingerprint-123456'),
+                ),
+              ],
+            )
+          : AppBar(
+              title: Text(_currentIndex == 1
+                  ? 'Field Force Directory'
+                  : _currentIndex == 2
+                      ? 'Field Activity Audit'
+                      : _currentIndex == 3
+                          ? 'Incident Oversight'
+                          : 'Telecaller Leads'),
+              actions: [
+                IconButton(
+                  icon: const Icon(Icons.refresh),
+                  tooltip: 'Refresh Analytics',
+                  onPressed: () async {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Refreshing management metrics...')),
+                    );
+                    await appProvider.fetchAdminDashboardData();
+                  },
+                ),
+                IconButton(
+                  icon: const Icon(Icons.logout),
+                  tooltip: 'Logout',
+                  onPressed: () => appProvider.logout('mock-device-fingerprint-123456'),
+                ),
+              ],
+            ),
       body: tabs[_currentIndex],
-      bottomNavigationBar: BottomNavigationBar(
+      bottomNavigationBar: BestieBottomNav(
         currentIndex: _currentIndex,
         onTap: (index) {
           setState(() {
             _currentIndex = index;
           });
         },
-        type: BottomNavigationBarType.fixed,
-        selectedItemColor: const Color(0xFF1E3A8A),
-        unselectedItemColor: Colors.grey,
         items: const [
-          BottomNavigationBarItem(
-            icon: Icon(Icons.insights_outlined),
-            activeIcon: Icon(Icons.insights),
-            label: 'Oversight',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.people_outline),
-            activeIcon: Icon(Icons.people),
-            label: 'Team',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.assignment_outlined),
-            activeIcon: Icon(Icons.assignment),
-            label: 'Logs',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.notification_important_outlined),
-            activeIcon: Icon(Icons.notification_important),
-            label: 'Incidents',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.headset_mic_outlined),
-            activeIcon: Icon(Icons.headset_mic),
-            label: 'Telecaller',
-          ),
+          BestieNavItem(Icons.insights_outlined, Icons.insights, 'Oversight'),
+          BestieNavItem(Icons.people_outline, Icons.people, 'Team'),
+          BestieNavItem(Icons.assignment_outlined, Icons.assignment, 'Logs'),
+          BestieNavItem(Icons.notification_important_outlined, Icons.notification_important, 'Incidents'),
+          BestieNavItem(Icons.headset_mic_outlined, Icons.headset_mic, 'Telecaller'),
         ],
       ),
     );
@@ -2449,40 +2505,39 @@ class AdminHomeTab extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // Organization Profile Header
-          Card(
-            color: const Color(0xFF1E3A8A),
-            child: Padding(
-              padding: const EdgeInsets.all(20.0),
-              child: Column(
-                children: [
-                  const Icon(Icons.business, color: Colors.white70, size: 36),
-                  const SizedBox(height: 8),
-                  Text(
-                    stats['org']?['name'] ?? 'Loading Corp...',
-                    style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    'Workspace: ${stats['org']?['email'] ?? "admin@alpha.com"}',
-                    style: const TextStyle(color: Colors.white70, fontSize: 12),
-                  ),
-                  const SizedBox(height: 4),
-                  const Chip(
-                    label: Text('MANAGEMENT DESK', style: TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold)),
-                    backgroundColor: Color(0xFFF59E0B),
-                    padding: EdgeInsets.zero,
-                  )
-                ],
+          ClipRRect(
+            borderRadius: BorderRadius.circular(BestieTokens.rLg),
+            child: Container(
+              decoration: const BoxDecoration(gradient: BestieTokens.gBrand),
+              child: Padding(
+                padding: const EdgeInsets.all(20.0),
+                child: Column(
+                  children: [
+                    const Icon(Icons.business, color: Colors.white70, size: 36),
+                    const SizedBox(height: 8),
+                    Text(
+                      stats['org']?['name'] ?? 'Loading Corp...',
+                      style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Workspace: ${stats['org']?['email'] ?? "admin@alpha.com"}',
+                      style: const TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                    const SizedBox(height: 4),
+                    const Chip(
+                      label: Text('MANAGEMENT DESK', style: TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold)),
+                      backgroundColor: BestieTokens.cWarning,
+                      padding: EdgeInsets.zero,
+                    )
+                  ],
+                ),
               ),
             ),
           ),
           
           const SizedBox(height: 16),
-          const Padding(
-            padding: EdgeInsets.only(left: 8.0, bottom: 8),
-            child: Text('LIVE FIELD KEY PERFORMANCE INDICATORS', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.grey)),
-          ),
+          const BestieSectionTitle(title: 'Live field KPIs'),
 
           // KPIs Grid
           GridView.count(
@@ -2530,7 +2585,7 @@ class AdminHomeTab extends StatelessWidget {
           Card(
             child: ListTile(
               leading: const CircleAvatar(
-                backgroundColor: Color(0xFF1E3A8A),
+                backgroundColor: BestieTokens.cBrand,
                 foregroundColor: Colors.white,
                 child: Icon(Icons.timer),
               ),
@@ -2691,7 +2746,7 @@ class _AdminTeamTabState extends State<AdminTeamTab> {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                const Text('Create New Executive (POST /users)', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF1E3A8A)), textAlign: TextAlign.center),
+                const Text('Create New Executive (POST /users)', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: BestieTokens.cBrand), textAlign: TextAlign.center),
                 const SizedBox(height: 16),
                 
                 TextFormField(
@@ -2765,7 +2820,7 @@ class _AdminTeamTabState extends State<AdminTeamTab> {
           return Card(
             child: ListTile(
               leading: CircleAvatar(
-                backgroundColor: const Color(0xFF1E3A8A),
+                backgroundColor: BestieTokens.cBrand,
                 foregroundColor: Colors.white,
                 child: Text(user['name'].toString().substring(0, 1).toUpperCase()),
               ),
@@ -2802,7 +2857,7 @@ class _AdminTeamTabState extends State<AdminTeamTab> {
       ),
       floatingActionButton: FloatingActionButton(
         onPressed: () => _showAddUserSheet(context, appProvider),
-        backgroundColor: const Color(0xFF1E3A8A),
+        backgroundColor: BestieTokens.cBrand,
         foregroundColor: Colors.white,
         tooltip: 'Add Field Executive',
         child: const Icon(Icons.person_add),
@@ -2971,8 +3026,8 @@ class AdminLiveActivitiesTab extends StatelessWidget {
       child: Column(
         children: [
           const TabBar(
-            labelColor: Color(0xFF1E3A8A),
-            indicatorColor: Color(0xFF1E3A8A),
+            labelColor: BestieTokens.cBrand,
+            indicatorColor: BestieTokens.cBrand,
             tabs: [
               Tab(icon: Icon(Icons.storefront), text: 'Visits & Orders'),
               Tab(icon: Icon(Icons.location_on), text: 'GPS Location Pings'),
@@ -3030,7 +3085,7 @@ class AdminLiveActivitiesTab extends StatelessWidget {
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     Expanded(
-                      child: Text(visit['outletName'], style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Color(0xFF1E3A8A))),
+                      child: Text(visit['outletName'], style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: BestieTokens.cBrand)),
                     ),
                     Chip(
                       label: Text(checkedOut ? 'COMPLETED' : 'IN VISIT', style: const TextStyle(fontSize: 9, color: Colors.white, fontWeight: FontWeight.bold)),
@@ -3094,7 +3149,7 @@ class AdminLiveActivitiesTab extends StatelessWidget {
                   ),
                   child: Row(
                     children: [
-                      const Icon(Icons.my_location, size: 18, color: Color(0xFF1E3A8A)),
+                      const Icon(Icons.my_location, size: 18, color: BestieTokens.cBrand),
                       const SizedBox(width: 8),
                       Expanded(
                         child: Column(
