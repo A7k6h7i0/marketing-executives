@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 import '../../../core/design/tokens.dart';
 import '../../../core/design/widgets.dart';
 import '../../../core/network/app_provider.dart';
+import '../../../core/utils/device_id.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -36,7 +37,7 @@ class _LoginScreenState extends State<LoginScreen> {
     setState(() => _error = null);
 
     final provider = Provider.of<AppProvider>(context, listen: false);
-    const deviceId = 'mock-device-fingerprint-123456';
+    final deviceId = await DeviceId.get();
 
     final success = await provider.login(
       email,

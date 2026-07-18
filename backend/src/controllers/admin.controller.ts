@@ -394,3 +394,53 @@ export const updateUser = async (req: AuthenticatedRequest, res: Response): Prom
     res.status(500).json({ error: error.message });
   }
 };
+
+/** Live field check-ins for managers: who, where, selfie, GPS, times. */
+export const getLiveVisits = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const scope = getRoleScopeFilter(req.user);
+    const days = Math.min(Math.max(parseInt(String(req.query.days || "1"), 10) || 1, 1), 30);
+    const since = new Date();
+    since.setHours(0, 0, 0, 0);
+    if (days > 1) {
+      since.setDate(since.getDate() - (days - 1));
+    }
+
+    const visits = await prisma.visit.findMany({
+      where: {
+        checkinTime: { gte: since },
+        user: scope,
+      },
+      include: {
+        user: { select: { id: true, email: true, phone: true, name: true, region: true, role: true } },
+        outlet: true,
+      },
+      orderBy: { checkinTime: "desc" },
+      take: 200,
+    });
+
+    res.status(200).json({
+      visits: visits.map((v) => ({
+        id: v.id,
+        executiveId: v.userId,
+        executiveName: v.user.name || v.user.email,
+        executiveEmail: v.user.email,
+        executivePhone: v.user.phone,
+        region: v.user.region,
+        outletId: v.outletId,
+        outletName: v.outlet.name,
+        outletAddress: v.outlet.address,
+        checkInTime: v.checkinTime,
+        checkOutTime: v.checkoutTime,
+        gpsLat: Number(v.gpsLat),
+        gpsLng: Number(v.gpsLng),
+        selfieUrl: v.selfieUrl,
+        salesValue: Number(v.salesValue),
+        remarks: v.remarks,
+        status: v.checkoutTime ? "COMPLETED" : "IN_VISIT",
+      })),
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+};

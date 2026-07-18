@@ -4,24 +4,90 @@ import { AuthenticatedRequest } from "../middlewares/auth";
 import { calculateDistanceKM } from "../utils/distance";
 import { SyncStatus } from "@prisma/client";
 
-// Mock Product Catalog
-export const MOCK_PRODUCTS = [
-  { sku: "SKU-SODA-01", name: "Classic Cola 500ml", unitPrice: 1.50 },
-  { sku: "SKU-SODA-02", name: "Diet Lemon-Lime 500ml", unitPrice: 1.60 },
-  { sku: "SKU-JUICE-01", name: "100% Orange Juice 1L", unitPrice: 3.20 },
-  { sku: "SKU-JUICE-02", name: "Apple Nectar 1L", unitPrice: 2.80 },
-  { sku: "SKU-CHIP-01", name: "Barbecue Potato Chips 150g", unitPrice: 2.00 },
-  { sku: "SKU-CHIP-02", name: "Sour Cream & Onion 150g", unitPrice: 2.00 },
-  { sku: "SKU-WATER-01", name: "Mineral Water 1.5L", unitPrice: 0.80 },
-];
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const isUuid = (value: unknown): value is string =>
+  typeof value === "string" && UUID_RE.test(value);
+
+type OutletPayload = {
+  name?: string;
+  address?: string;
+  contactPhone?: string;
+  contactEmail?: string;
+  gpsLat?: number;
+  gpsLng?: number;
+  latitude?: number;
+  longitude?: number;
+};
+
+async function resolveOutletId(
+  outletId: unknown,
+  outletPayload: OutletPayload | undefined,
+  checkInLat: number,
+  checkInLng: number
+) {
+  if (isUuid(outletId)) {
+    const existing = await prisma.outlet.findUnique({ where: { id: outletId } });
+    if (existing) return existing.id;
+  }
+
+  const name = outletPayload?.name?.trim();
+  const lat = Number(outletPayload?.gpsLat ?? outletPayload?.latitude ?? checkInLat);
+  const lng = Number(outletPayload?.gpsLng ?? outletPayload?.longitude ?? checkInLng);
+
+  if (!name || Number.isNaN(lat) || Number.isNaN(lng)) {
+    return null;
+  }
+
+  const candidates = await prisma.outlet.findMany({
+    where: { name: { equals: name, mode: "insensitive" } },
+    take: 20,
+  });
+
+  const match = candidates.find((o) => {
+    const dLat = Math.abs(Number(o.gpsLat) - lat);
+    const dLng = Math.abs(Number(o.gpsLng) - lng);
+    return dLat < 0.001 && dLng < 0.001;
+  });
+  if (match) return match.id;
+
+  const created = await prisma.outlet.create({
+    data: {
+      name,
+      address: outletPayload?.address || name,
+      contactPhone: outletPayload?.contactPhone || null,
+      contactEmail: outletPayload?.contactEmail || null,
+      gpsLat: lat,
+      gpsLng: lng,
+    },
+  });
+  return created.id;
+}
 
 export const getProducts = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
-  const query = (req.query.q as string || "").toLowerCase();
+  const query = ((req.query.q as string) || "").toLowerCase();
   try {
-    const filtered = MOCK_PRODUCTS.filter(
-      (p) => p.name.toLowerCase().includes(query) || p.sku.toLowerCase().includes(query)
-    );
-    res.status(200).json({ products: filtered });
+    const products = await prisma.product.findMany({
+      where: query
+        ? {
+            OR: [
+              { name: { contains: query, mode: "insensitive" } },
+              { sku: { contains: query, mode: "insensitive" } },
+            ],
+          }
+        : undefined,
+      orderBy: { name: "asc" },
+    });
+
+    res.status(200).json({
+      products: products.map((p) => ({
+        id: p.id,
+        sku: p.sku,
+        name: p.name,
+        unitPrice: Number(p.unitPrice),
+      })),
+    });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -29,49 +95,70 @@ export const getProducts = async (req: AuthenticatedRequest, res: Response): Pro
 
 export const checkIn = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const userId = req.user?.id;
-  const { outletId, gpsLat, gpsLng, selfieUrl, managerOverrideFlag } = req.body;
+  const { outletId, outlet, gpsLat, gpsLng, selfieUrl, managerOverrideFlag } = req.body;
 
-  if (!userId || !outletId || gpsLat === undefined || gpsLng === undefined || !selfieUrl) {
-    res.status(400).json({ error: "outletId, gpsLat, gpsLng, and selfieUrl are required." });
+  if (!userId || gpsLat === undefined || gpsLng === undefined || !selfieUrl) {
+    res.status(400).json({ error: "gpsLat, gpsLng, and selfieUrl are required." });
     return;
   }
 
   try {
-    // 1. Fetch Outlet's registered coordinates
-    const outlet = await prisma.outlet.findUnique({
-      where: { id: outletId },
+    const openVisit = await prisma.visit.findFirst({
+      where: { userId, checkoutTime: null },
     });
+    if (openVisit) {
+      res.status(409).json({
+        error: "Another outlet visit is already active. Please check out first.",
+        activeVisitId: openVisit.id,
+        activeOutletId: openVisit.outletId,
+      });
+      return;
+    }
 
-    if (!outlet) {
+    const resolvedOutletId = await resolveOutletId(
+      outletId,
+      outlet,
+      Number(gpsLat),
+      Number(gpsLng)
+    );
+
+    if (!resolvedOutletId) {
+      res.status(400).json({
+        error: "outletId (UUID) or outlet { name, gpsLat, gpsLng } is required.",
+      });
+      return;
+    }
+
+    const outletRecord = await prisma.outlet.findUnique({ where: { id: resolvedOutletId } });
+    if (!outletRecord) {
       res.status(404).json({ error: "Outlet not found in master database." });
       return;
     }
 
-    // 2. Check distance
-    const distanceMeters = calculateDistanceKM(
-      Number(outlet.gpsLat),
-      Number(outlet.gpsLng),
-      Number(gpsLat),
-      Number(gpsLng)
-    ) * 1000;
+    const distanceMeters =
+      calculateDistanceKM(
+        Number(outletRecord.gpsLat),
+        Number(outletRecord.gpsLng),
+        Number(gpsLat),
+        Number(gpsLng)
+      ) * 1000;
 
-    const THRESHOLD_METERS = 100;
+    const thresholdMeters = Number(process.env.GEOFENCE_THRESHOLD_METERS || 100);
 
-    if (distanceMeters > THRESHOLD_METERS && !managerOverrideFlag) {
+    if (distanceMeters > thresholdMeters && !managerOverrideFlag) {
       res.status(400).json({
         error: "Geofence warning: You are too far from this outlet.",
         distanceMeters: Number(distanceMeters.toFixed(1)),
-        thresholdMeters: THRESHOLD_METERS,
+        thresholdMeters,
         requiresOverride: true,
       });
       return;
     }
 
-    // Create the visit check-in record
     const visit = await prisma.visit.create({
       data: {
         userId,
-        outletId,
+        outletId: resolvedOutletId,
         gpsLat: Number(gpsLat),
         gpsLng: Number(gpsLng),
         selfieUrl,
@@ -92,59 +179,63 @@ export const checkIn = async (req: AuthenticatedRequest, res: Response): Promise
 
 export const placeOrder = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const visitId = req.params.visitId as string;
-  const { productsOrdered, remarks } = req.body; // productsOrdered: Array of { sku, qty, unitPrice }
+  const { productsOrdered, remarks } = req.body;
 
-  if (!productsOrdered || !Array.isArray(productsOrdered) || productsOrdered.length === 0) {
-    res.status(400).json({ error: "productsOrdered array is required and cannot be empty." });
+  const hasProducts = Array.isArray(productsOrdered) && productsOrdered.length > 0;
+  const hasRemarks = typeof remarks === "string" && remarks.trim().length > 0;
+
+  if (!hasProducts && !hasRemarks) {
+    res.status(400).json({ error: "Provide productsOrdered and/or remarks." });
+    return;
+  }
+
+  if (remarks && remarks.length > 500) {
+    res.status(400).json({ error: "Remarks cannot exceed 500 characters." });
     return;
   }
 
   try {
-    const visit = await prisma.visit.findUnique({
-      where: { id: visitId },
-    });
-
+    const visit = await prisma.visit.findUnique({ where: { id: visitId } });
     if (!visit) {
       res.status(404).json({ error: "Visit record not found." });
       return;
     }
 
-    // Calculate sales value
     let totalSalesValue = 0;
-    for (const item of productsOrdered) {
-      if (!item.sku || !item.qty || !item.unitPrice) {
-        res.status(400).json({ error: "Each ordered product must contain sku, qty, and unitPrice." });
-        return;
-      }
-      if (item.qty <= 0) {
-        res.status(400).json({ error: "Quantity must be greater than 0." });
-        return;
-      }
-      totalSalesValue += item.qty * item.unitPrice;
-    }
+    const normalizedProducts: Array<{ sku: string; qty: number; unitPrice: number; name?: string }> = [];
 
-    if (totalSalesValue <= 0) {
-      res.status(400).json({ error: "Order value must be greater than 0." });
-      return;
-    }
-
-    // Check remarks length
-    if (remarks && remarks.length > 500) {
-      res.status(400).json({ error: "Remarks cannot exceed 500 characters." });
-      return;
+    if (hasProducts) {
+      for (const item of productsOrdered) {
+        if (!item.sku || item.qty === undefined || item.unitPrice === undefined) {
+          res.status(400).json({ error: "Each ordered product must contain sku, qty, and unitPrice." });
+          return;
+        }
+        if (item.qty <= 0) {
+          res.status(400).json({ error: "Quantity must be greater than 0." });
+          return;
+        }
+        const line = {
+          sku: String(item.sku),
+          qty: Number(item.qty),
+          unitPrice: Number(item.unitPrice),
+          name: item.name ? String(item.name) : undefined,
+        };
+        totalSalesValue += line.qty * line.unitPrice;
+        normalizedProducts.push(line);
+      }
     }
 
     const updatedVisit = await prisma.visit.update({
       where: { id: visitId },
       data: {
-        productsOrdered: productsOrdered as any,
-        salesValue: totalSalesValue,
-        remarks,
+        productsOrdered: hasProducts ? (normalizedProducts as any) : visit.productsOrdered,
+        salesValue: hasProducts ? totalSalesValue : visit.salesValue,
+        remarks: hasRemarks ? remarks.trim() : visit.remarks,
       },
     });
 
     res.status(200).json({
-      message: "Order items submitted successfully",
+      message: "Visit notes/order submitted successfully",
       visit: updatedVisit,
     });
   } catch (error: any) {
@@ -154,42 +245,29 @@ export const placeOrder = async (req: AuthenticatedRequest, res: Response): Prom
 
 export const checkOut = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const visitId = req.params.visitId as string;
-  const userId = req.user?.id;
 
   try {
-    const visit = await prisma.visit.findUnique({
-      where: { id: visitId },
-    });
-
+    const visit = await prisma.visit.findUnique({ where: { id: visitId } });
     if (!visit) {
       res.status(404).json({ error: "Visit record not found." });
       return;
     }
 
     const checkoutTime = new Date();
-
     const updatedVisit = await prisma.visit.update({
       where: { id: visitId },
-      data: {
-        checkoutTime,
-      },
+      data: { checkoutTime },
     });
 
-    // On checkout, let's update the today's Completed Visits in DailyPlan
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
     const plan = await prisma.dailyPlan.findFirst({
-      where: {
-        userId: visit.userId,
-        planDate: today,
-      },
+      where: { userId: visit.userId, planDate: today },
     });
 
     if (plan) {
-      // Count total checked out visits today
       const todayStart = new Date(today);
-      todayStart.setHours(0, 0, 0, 0);
       const todayEnd = new Date(today);
       todayEnd.setHours(23, 59, 59, 999);
 
@@ -203,9 +281,7 @@ export const checkOut = async (req: AuthenticatedRequest, res: Response): Promis
 
       await prisma.dailyPlan.update({
         where: { id: plan.id },
-        data: {
-          completedVisits: completedVisitsCount,
-        },
+        data: { completedVisits: completedVisitsCount },
       });
     }
 
@@ -238,9 +314,7 @@ export const getVisits = async (req: AuthenticatedRequest, res: Response): Promi
         userId,
         checkinTime: { gte: startOfDay, lte: endOfDay },
       },
-      include: {
-        outlet: true,
-      },
+      include: { outlet: true },
       orderBy: { checkinTime: "desc" },
     });
 

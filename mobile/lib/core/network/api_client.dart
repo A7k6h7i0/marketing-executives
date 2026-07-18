@@ -7,9 +7,9 @@ class ApiClient {
 
   ApiClient() : _dio = Dio() {
     _dio.options.baseUrl = ApiEndpoints.baseUrl;
-    _dio.options.connectTimeout = const Duration(seconds: 15);
-    _dio.options.receiveTimeout = const Duration(seconds: 15);
-    _dio.options.headers = {'Content-Type': 'application/json'};
+    _dio.options.connectTimeout = const Duration(seconds: 20);
+    _dio.options.receiveTimeout = const Duration(seconds: 20);
+    _dio.options.headers = {'Accept': 'application/json'};
 
     // Add interceptor to automatically attach JWT token and log requests
     _dio.interceptors.add(
@@ -22,8 +22,13 @@ class ApiClient {
             options.headers['Authorization'] = 'Bearer $token';
           }
 
+          // Let Dio set multipart boundary when uploading files.
+          if (options.data is! FormData) {
+            options.headers['Content-Type'] = 'application/json';
+          }
+
           print('--> [API REQUEST] ${options.method} ${options.baseUrl}${options.path}');
-          if (options.data != null) {
+          if (options.data != null && options.data is! FormData) {
             print('Body: ${options.data}');
           }
           return handler.next(options);

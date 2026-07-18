@@ -1,4 +1,8 @@
-import { PrismaClient, Role, Grade, TrackingStartPoint, AttendanceStatus, BreakType, BreakStatus, SyncStatus, IncidentType, ResolutionStatus, LeadStatus, RouteStatus } from "@prisma/client";
+import {
+  PrismaClient,
+  Role,
+  Grade,
+} from "@prisma/client";
 import bcrypt from "bcryptjs";
 
 const prisma = new PrismaClient();
@@ -6,7 +10,6 @@ const prisma = new PrismaClient();
 async function main() {
   console.log("Seeding started...");
 
-  // Clear database
   await prisma.telecallerCall.deleteMany();
   await prisma.telecallerLead.deleteMany();
   await prisma.rating.deleteMany();
@@ -18,12 +21,13 @@ async function main() {
   await prisma.gpsPing.deleteMany();
   await prisma.break.deleteMany();
   await prisma.attendance.deleteMany();
+  await prisma.product.deleteMany();
   await prisma.outlet.deleteMany();
+  await prisma.territoryRoute.deleteMany();
   await prisma.user.deleteMany();
 
   console.log("Database cleared.");
 
-  // 2. Create default users
   const passwordHash = await bcrypt.hash("Password123!", 10);
 
   const admin = await prisma.user.create({
@@ -79,7 +83,13 @@ async function main() {
     telecaller: telecaller.email,
   });
 
-  // 3. Create mock outlets
+  const downtown = await prisma.territoryRoute.create({
+    data: { name: "Downtown Retail Zone", region: "North" },
+  });
+  const westside = await prisma.territoryRoute.create({
+    data: { name: "Westside Commercial Hub", region: "North" },
+  });
+
   const outlets = await Promise.all([
     prisma.outlet.create({
       data: {
@@ -88,9 +98,10 @@ async function main() {
         contactPhone: "+15550000001",
         contactEmail: "downtown@supermarket.com",
         gpsLat: 40.7128,
-        gpsLng: -74.0060,
+        gpsLng: -74.006,
         grade: Grade.A,
         overallRating: 4.8,
+        routeId: downtown.id,
       },
     }),
     prisma.outlet.create({
@@ -100,9 +111,10 @@ async function main() {
         contactPhone: "+15550000002",
         contactEmail: "westside@groceryhub.com",
         gpsLat: 40.7138,
-        gpsLng: -74.0080,
+        gpsLng: -74.008,
         grade: Grade.B,
         overallRating: 3.5,
+        routeId: westside.id,
       },
     }),
     prisma.outlet.create({
@@ -111,26 +123,40 @@ async function main() {
         address: "456 High Street, Northside North",
         contactPhone: "+15550000003",
         contactEmail: "northside@pharmacy.com",
-        gpsLat: 40.7150,
-        gpsLng: -74.0040,
+        gpsLat: 40.715,
+        gpsLng: -74.004,
         grade: Grade.C,
         overallRating: 2.8,
+        routeId: downtown.id,
       },
     }),
   ]);
 
-  console.log(`Created ${outlets.length} master outlets.`);
+  console.log(`Created ${outlets.length} master outlets across ${2} routes.`);
 
-  // 4. Create a Daily Plan for today
+  await prisma.product.createMany({
+    data: [
+      { sku: "SKU-SODA-01", name: "Classic Cola 500ml", unitPrice: 1.5 },
+      { sku: "SKU-SODA-02", name: "Diet Lemon-Lime 500ml", unitPrice: 1.6 },
+      { sku: "SKU-JUICE-01", name: "100% Orange Juice 1L", unitPrice: 3.2 },
+      { sku: "SKU-JUICE-02", name: "Apple Nectar 1L", unitPrice: 2.8 },
+      { sku: "SKU-CHIP-01", name: "Barbecue Potato Chips 150g", unitPrice: 2.0 },
+      { sku: "SKU-CHIP-02", name: "Sour Cream & Onion 150g", unitPrice: 2.0 },
+      { sku: "SKU-WATER-01", name: "Mineral Water 1.5L", unitPrice: 0.8 },
+    ],
+  });
+
+  console.log("Product catalog seeded.");
+
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
   const plan = await prisma.dailyPlan.create({
     data: {
       userId: executive.id,
-      routeId: "route-downtown",
-      areaName: "Downtown Retail Zone",
-      plannedVisits: 3,
+      routeId: downtown.id,
+      areaName: downtown.name,
+      plannedVisits: 2,
       completedVisits: 0,
       planDate: today,
     },
@@ -138,7 +164,6 @@ async function main() {
 
   console.log("Created Daily Plan for executive today:", plan.areaName);
 
-  // 5. Sample telecaller leads
   await prisma.telecallerLead.createMany({
     data: [
       {

@@ -5,6 +5,7 @@ import '../../../core/design/shell.dart';
 import '../../../core/design/tokens.dart';
 import '../../../core/design/widgets.dart';
 import '../../../core/network/app_provider.dart';
+import '../../../core/utils/device_id.dart';
 import 'package:intl/intl.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:geocoding/geocoding.dart';
@@ -80,9 +81,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
       const IncidentsTab(),
     ];
 
+    final onDuty = appProvider.attendanceStatus == 'LOGGED_IN' ||
+        appProvider.attendanceStatus == 'PRESENT';
+
     return Scaffold(
       backgroundColor: BestieTokens.cBg,
-      extendBody: true,
+      extendBody: false,
       appBar: _currentIndex == 0
           ? BestieShellAppBar(
               actions: [
@@ -99,7 +103,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 IconButton(
                   icon: const Icon(Icons.logout),
                   tooltip: 'Logout',
-                  onPressed: () => appProvider.logout('mock-device-fingerprint-123456'),
+                  onPressed: () async {
+                    final deviceId = await DeviceId.get();
+                    await appProvider.logout(deviceId);
+                  },
                 ),
               ],
             )
@@ -123,35 +130,34 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 IconButton(
                   icon: const Icon(Icons.logout),
                   tooltip: 'Logout',
-                  onPressed: () => appProvider.logout('mock-device-fingerprint-123456'),
+                  onPressed: () async {
+                    final deviceId = await DeviceId.get();
+                    await appProvider.logout(deviceId);
+                  },
                 ),
               ],
             ),
-      body: Stack(
-        children: [
-          tabs[_currentIndex],
-          
-          // Persistent Break Widget at the bottom (Fulfills Module 2 global break system requirement)
-          if (appProvider.attendanceStatus == 'LOGGED_IN' || appProvider.attendanceStatus == 'PRESENT')
-            Positioned(
-              right: 16,
-              bottom: 16,
-              child: FloatingActionButton.extended(
-                backgroundColor: appProvider.activeBreak != null ? BestieTokens.cDanger : BestieTokens.cWarning,
-                foregroundColor: Colors.white,
-                icon: Icon(appProvider.activeBreak != null ? Icons.pause_circle_filled : Icons.free_breakfast),
-                label: Text(appProvider.activeBreak != null ? 'End Break' : 'Take Break'),
-                onPressed: () {
-                  if (appProvider.activeBreak != null) {
-                    _showEndBreakDialog(context, appProvider);
-                  } else {
-                    _showStartBreakDialog(context, appProvider);
-                  }
-                },
+      body: tabs[_currentIndex],
+      floatingActionButton: onDuty
+          ? FloatingActionButton.extended(
+              heroTag: 'break_fab',
+              backgroundColor:
+                  appProvider.activeBreak != null ? BestieTokens.cDanger : BestieTokens.cWarning,
+              foregroundColor: Colors.white,
+              icon: Icon(
+                appProvider.activeBreak != null ? Icons.pause_circle_filled : Icons.free_breakfast,
               ),
-            ),
-        ],
-      ),
+              label: Text(appProvider.activeBreak != null ? 'End Break' : 'Take Break'),
+              onPressed: () {
+                if (appProvider.activeBreak != null) {
+                  _showEndBreakDialog(context, appProvider);
+                } else {
+                  _showStartBreakDialog(context, appProvider);
+                }
+              },
+            )
+          : null,
+      floatingActionButtonLocation: FloatingActionButtonLocation.endFloat,
       bottomNavigationBar: BestieBottomNav(
         currentIndex: _currentIndex,
         onTap: (index) {
@@ -504,7 +510,7 @@ class HomeTab extends StatelessWidget {
     final displayName = appProvider.email?.split('@').first ?? 'Executive';
 
     return SingleChildScrollView(
-      padding: const EdgeInsets.only(bottom: 96),
+      padding: const EdgeInsets.only(bottom: 120),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -693,6 +699,76 @@ class HomeTab extends StatelessWidget {
               ),
             ),
 
+          if (appProvider.activeVisit != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(BestieTokens.s4, BestieTokens.s3, BestieTokens.s4, 0),
+              child: Card(
+                color: Colors.orange.shade50,
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const Text(
+                        'ACTIVE OUTLET VISIT',
+                        style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.orange),
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        appProvider.activeVisit!['outletName']?.toString() ??
+                            (() {
+                              final activeId = appProvider.activeVisit!['outletId']?.toString();
+                              final match = appProvider.plannedOutlets.cast<dynamic>().firstWhere(
+                                (o) => o is Map && o['id']?.toString() == activeId,
+                                orElse: () => null,
+                              );
+                              if (match is Map) return match['name']?.toString() ?? 'Checked-in outlet';
+                              return 'Checked-in outlet';
+                            })(),
+                        style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(height: 4),
+                      const Text(
+                        'Checked in — add remarks/order or check out when done.',
+                        style: TextStyle(fontSize: 12, color: Colors.black54),
+                      ),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: ElevatedButton.icon(
+                              icon: const Icon(Icons.edit_note, size: 18),
+                              label: const Text('Remarks / Order'),
+                              onPressed: () => showOrderCatalogScreen(context, appProvider),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: ElevatedButton.icon(
+                              style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
+                              icon: const Icon(Icons.logout, size: 18),
+                              label: const Text('Check-out'),
+                              onPressed: () async {
+                                final ok = await appProvider.checkoutOutlet();
+                                if (context.mounted) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text(ok ? 'Checked out successfully.' : 'Checkout failed.'),
+                                      backgroundColor: ok ? Colors.green : Colors.red,
+                                    ),
+                                  );
+                                }
+                              },
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+
           // 3. Daily Area Selector (If no plan active, Module 4)
           if (appProvider.todayPlan == null)
             Padding(
@@ -742,20 +818,47 @@ class HomeTab extends StatelessWidget {
             ),
             ...appProvider.plannedOutlets.map((outlet) {
               final isCompleted = outlet['visitStatus'] == 'COMPLETED';
+              final isActiveHere = appProvider.isVisitActiveForOutlet(outlet['id']?.toString());
 
               return Card(
-                color: isCompleted ? Colors.green[50] : Colors.white,
+                color: isCompleted
+                    ? Colors.green[50]
+                    : isActiveHere
+                        ? Colors.orange[50]
+                        : Colors.white,
                 child: ListTile(
                   leading: CircleAvatar(
-                    backgroundColor: isCompleted ? Colors.green : BestieTokens.cBrand,
+                    backgroundColor: isCompleted
+                        ? Colors.green
+                        : isActiveHere
+                            ? Colors.orange
+                            : BestieTokens.cBrand,
                     foregroundColor: Colors.white,
-                    child: Icon(isCompleted ? Icons.check : Icons.store),
+                    child: Icon(isCompleted
+                        ? Icons.check
+                        : isActiveHere
+                            ? Icons.how_to_reg
+                            : Icons.store),
                   ),
                   title: Text(outlet['name'], style: const TextStyle(fontWeight: FontWeight.bold)),
-                  subtitle: Text(outlet['address']),
+                  subtitle: Text(
+                    isCompleted
+                        ? 'Visit completed'
+                        : isActiveHere
+                            ? 'Checked in — tap for remarks / checkout'
+                            : (outlet['address']?.toString() ?? ''),
+                  ),
                   trailing: Icon(
-                    isCompleted ? Icons.check_circle : Icons.arrow_forward_ios_outlined,
-                    color: isCompleted ? Colors.green : Colors.grey,
+                    isCompleted
+                        ? Icons.check_circle
+                        : isActiveHere
+                            ? Icons.edit_note
+                            : Icons.arrow_forward_ios_outlined,
+                    color: isCompleted
+                        ? Colors.green
+                        : isActiveHere
+                            ? Colors.orange
+                            : Colors.grey,
                     size: 20,
                   ),
                   onTap: () {
@@ -1152,10 +1255,15 @@ class HomeTab extends StatelessWidget {
     showDialog(
       context: context,
       builder: (context) {
-        final isCompleted = outlet['visitStatus'] == 'COMPLETED';
-        final activeVisit = provider.activeVisit;
-        final isThisOutletActive = activeVisit != null &&
-            activeVisit['outletId']?.toString() == outlet['id']?.toString();
+        final latestProvider = Provider.of<AppProvider>(context);
+        final isCompleted = outlet['visitStatus'] == 'COMPLETED' ||
+            latestProvider.plannedOutlets.cast<dynamic>().any(
+              (o) => o is Map &&
+                  o['id']?.toString() == outlet['id']?.toString() &&
+                  o['visitStatus'] == 'COMPLETED',
+            );
+        final activeVisit = latestProvider.activeVisit;
+        final isThisOutletActive = latestProvider.isVisitActiveForOutlet(outlet['id']?.toString());
         final hasOtherActiveVisit = activeVisit != null && !isThisOutletActive;
 
         return AlertDialog(
@@ -1169,7 +1277,7 @@ class HomeTab extends StatelessWidget {
               Text('Grade: ${outlet['grade'] ?? "Unrated"} | Rating: ${outlet['overallRating'] ?? "None"}'),
               const SizedBox(height: 12),
               FutureBuilder<List<Map<String, dynamic>>>(
-                future: provider.getOutletVisitHistory(outlet['id']?.toString() ?? ''),
+                future: latestProvider.getOutletVisitHistory(outlet['id']?.toString() ?? ''),
                 builder: (context, snapshot) {
                   final history = snapshot.data ?? [];
                   if (snapshot.connectionState == ConnectionState.waiting) {
@@ -1208,9 +1316,9 @@ class HomeTab extends StatelessWidget {
               if (!isCompleted && activeVisit == null)
                 const Text('To start the visit checklist, you must first check in at the outlet.'),
               if (isThisOutletActive)
-                const Text('Active Visit Session Running. You can submit orders and checkout now.'),
+                const Text('You are checked in here. Add remarks/order or check out when finished.'),
               if (hasOtherActiveVisit)
-                const Text('Another outlet visit is currently active. Please check out there before starting a new visit.'),
+                const Text('Another outlet visit is currently active. Check out from the active visit banner on Home, or force check-out below.'),
             ],
           ),
           actions: [
@@ -1218,13 +1326,21 @@ class HomeTab extends StatelessWidget {
               onPressed: () => Navigator.pop(context),
               child: const Text('CLOSE'),
             ),
+            if (hasOtherActiveVisit)
+              TextButton(
+                onPressed: () async {
+                  await latestProvider.forceCheckoutActiveVisit();
+                  if (context.mounted) Navigator.pop(context);
+                },
+                child: const Text('FORCE CHECK-OUT'),
+              ),
             if (!isCompleted && activeVisit == null)
               ElevatedButton.icon(
                 icon: const Icon(Icons.gps_fixed),
                 label: const Text('CHECK-IN (100M GEOFENCE)'),
                 onPressed: () async {
                   Navigator.pop(context);
-                  _runCheckInFlow(context, provider, outlet);
+                  _runCheckInFlow(context, latestProvider, outlet);
                 },
               ),
             if (isThisOutletActive) ...[
@@ -1233,7 +1349,7 @@ class HomeTab extends StatelessWidget {
                 label: const Text('ORDER / REMARKS'),
                 onPressed: () {
                   Navigator.pop(context);
-                showOrderCatalogScreen(context, provider);
+                  showOrderCatalogScreen(context, latestProvider);
                 },
               ),
               ElevatedButton.icon(
@@ -1241,7 +1357,7 @@ class HomeTab extends StatelessWidget {
                 label: const Text('CHECK-OUT'),
                 style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
                 onPressed: () async {
-                  await provider.checkoutOutlet();
+                  await latestProvider.checkoutOutlet();
                   if (context.mounted) Navigator.pop(context);
                 },
               ),
@@ -2442,7 +2558,10 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
                 IconButton(
                   icon: const Icon(Icons.logout),
                   tooltip: 'Logout',
-                  onPressed: () => appProvider.logout('mock-device-fingerprint-123456'),
+                  onPressed: () async {
+                    final deviceId = await DeviceId.get();
+                    await appProvider.logout(deviceId);
+                  },
                 ),
               ],
             )
@@ -2468,7 +2587,10 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
                 IconButton(
                   icon: const Icon(Icons.logout),
                   tooltip: 'Logout',
-                  onPressed: () => appProvider.logout('mock-device-fingerprint-123456'),
+                  onPressed: () async {
+                    final deviceId = await DeviceId.get();
+                    await appProvider.logout(deviceId);
+                  },
                 ),
               ],
             ),
@@ -3085,7 +3207,19 @@ class AdminLiveActivitiesTab extends StatelessWidget {
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     Expanded(
-                      child: Text(visit['outletName'], style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: BestieTokens.cBrand)),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            visit['executiveName']?.toString() ?? 'Executive',
+                            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: BestieTokens.cBrand),
+                          ),
+                          if ((visit['executiveEmail']?.toString() ?? '').isNotEmpty)
+                            Text(visit['executiveEmail'].toString(), style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                          const SizedBox(height: 4),
+                          Text(visit['outletName']?.toString() ?? 'Outlet', style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+                        ],
+                      ),
                     ),
                     Chip(
                       label: Text(checkedOut ? 'COMPLETED' : 'IN VISIT', style: const TextStyle(fontSize: 9, color: Colors.white, fontWeight: FontWeight.bold)),
@@ -3094,8 +3228,53 @@ class AdminLiveActivitiesTab extends StatelessWidget {
                     ),
                   ],
                 ),
-                Text(visit['outletAddress'], style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                Text(visit['outletAddress']?.toString() ?? '', style: const TextStyle(fontSize: 12, color: Colors.grey)),
                 const Divider(height: 20),
+
+                // Selfie first — mandatory admin visibility
+                if (visit['selfieUrl'] != null && visit['selfieUrl'].toString().isNotEmpty) ...[
+                  const Text('CHECK-IN SELFIE', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey)),
+                  const SizedBox(height: 6),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: visit['selfieUrl'].toString().startsWith('http')
+                        ? Image.network(
+                            visit['selfieUrl'],
+                            height: 140,
+                            width: double.infinity,
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, __, ___) => const SizedBox(
+                              height: 80,
+                              child: Center(child: Text('Selfie unavailable')),
+                            ),
+                          )
+                        : Image.file(
+                            File(visit['selfieUrl']),
+                            height: 140,
+                            width: double.infinity,
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, __, ___) => const SizedBox(
+                              height: 80,
+                              child: Center(child: Text('Selfie file missing')),
+                            ),
+                          ),
+                  ),
+                  const SizedBox(height: 12),
+                ] else ...[
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(10),
+                    margin: const EdgeInsets.only(bottom: 12),
+                    decoration: BoxDecoration(
+                      color: Colors.red.shade50,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Text(
+                      'No selfie attached to this check-in',
+                      style: TextStyle(color: Colors.red, fontSize: 12, fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                ],
                 
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -3139,7 +3318,7 @@ class AdminLiveActivitiesTab extends StatelessWidget {
                 ),
                 const SizedBox(height: 12),
                 
-                Text('Client Remarks: "${visit['remarks']}"', style: const TextStyle(fontSize: 12, fontStyle: FontStyle.italic)),
+                Text('Client Remarks: "${visit['remarks'] ?? ''}"', style: const TextStyle(fontSize: 12, fontStyle: FontStyle.italic)),
                 const SizedBox(height: 8),
                 Container(
                   padding: const EdgeInsets.all(10),
@@ -3156,7 +3335,7 @@ class AdminLiveActivitiesTab extends StatelessWidget {
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Text(
-                              'Location: ${visit['address'] ?? 'Address not resolved'}',
+                              'Location: ${visit['address'] ?? visit['outletAddress'] ?? 'Address not resolved'}',
                               style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
                             ),
                             Text(
@@ -3169,19 +3348,6 @@ class AdminLiveActivitiesTab extends StatelessWidget {
                     ],
                   ),
                 ),
-                
-                // Show Selfie preview if recorded!
-                if (visit['selfieUrl'] != null && visit['selfieUrl'].toString().isNotEmpty) ...[
-                  const SizedBox(height: 12),
-                  const Text('Identity Verification selfie:', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey)),
-                  const SizedBox(height: 6),
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(8),
-                    child: visit['selfieUrl'].toString().startsWith('http')
-                        ? Image.network(visit['selfieUrl'], height: 100, width: 100, fit: BoxFit.cover)
-                        : Image.file(File(visit['selfieUrl']), height: 100, width: 100, fit: BoxFit.cover),
-                  ),
-                ],
               ],
             ),
           ),

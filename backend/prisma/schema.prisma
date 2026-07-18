@@ -171,13 +171,38 @@ model Outlet {
   gpsLng            Decimal           @db.Decimal(9, 6)
   grade             Grade?
   overallRating     Decimal?          @db.Decimal(3, 2)
+  routeId           String?           @db.Uuid
   createdAt         DateTime          @default(now())
   updatedAt         DateTime          @updatedAt
+  route             TerritoryRoute?   @relation(fields: [routeId], references: [id], onDelete: SetNull)
   visits            Visit[]
   ratings           Rating[]
   convertedFromLead Lead?             @relation("ConvertedOutlet")
 
   @@map("outlets")
+}
+
+model TerritoryRoute {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @db.VarChar(120)
+  region    String   @db.VarChar(80)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  outlets   Outlet[]
+
+  @@map("territory_routes")
+}
+
+model Product {
+  id        String   @id @default(uuid()) @db.Uuid
+  sku       String   @unique @db.VarChar(64)
+  name      String   @db.VarChar(200)
+  unitPrice Decimal  @db.Decimal(12, 2)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("products")
 }
 
 model DailyPlan {

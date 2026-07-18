@@ -2,23 +2,26 @@ import { Response } from "express";
 import { prisma } from "../config/prisma";
 import { AuthenticatedRequest } from "../middlewares/auth";
 
-// Predefined routes/areas (can be fetched dynamically or mocked based on user region)
-const PREDEFINED_ROUTES = [
-  { id: "route-downtown", name: "Downtown Retail Zone", region: "North" },
-  { id: "route-westside", name: "Westside Commercial Hub", region: "West" },
-  { id: "route-suburbs", name: "East Suburban Markets", region: "East" },
-  { id: "route-south", name: "Southside Shopping Districts", region: "South" },
-];
-
 export const getRoutes = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    const userRegion = req.user?.region || "North";
-    // Filter routes by user region if set, otherwise return all
-    const filteredRoutes = PREDEFINED_ROUTES.filter(
-      (r) => !req.user?.region || r.region.toLowerCase() === userRegion.toLowerCase()
-    );
+    const userRegion = req.user?.region;
 
-    res.status(200).json({ routes: filteredRoutes });
+    const routes = await prisma.territoryRoute.findMany({
+      where: userRegion
+        ? { region: { equals: userRegion, mode: "insensitive" } }
+        : undefined,
+      include: { _count: { select: { outlets: true } } },
+      orderBy: { name: "asc" },
+    });
+
+    res.status(200).json({
+      routes: routes.map((r) => ({
+        id: r.id,
+        name: r.name,
+        region: r.region,
+        outletCount: r._count.outlets,
+      })),
+    });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -28,29 +31,33 @@ export const getRouteOutlets = async (req: AuthenticatedRequest, res: Response):
   const routeId = req.params.routeId as string;
 
   try {
-    // Find outlets. In a real system, outlets are linked to routes.
-    // For now, we query outlets that match the areaName or just return all available outlets
-    // as a fallback if the database is empty.
-    const route = PREDEFINED_ROUTES.find((r) => r.id === routeId);
+    const route = await prisma.territoryRoute.findUnique({
+      where: { id: routeId },
+      include: { outlets: { orderBy: { name: "asc" } } },
+    });
+
     if (!route) {
       res.status(404).json({ error: "Route not found." });
       return;
     }
 
-    const outlets = await prisma.outlet.findMany({
-      where: {
-        address: { contains: route.name.split(" ")[0], mode: "insensitive" },
-      },
+    res.status(200).json({
+      routeId: route.id,
+      routeName: route.name,
+      outlets: route.outlets.map((o) => ({
+        id: o.id,
+        name: o.name,
+        address: o.address,
+        latitude: Number(o.gpsLat),
+        longitude: Number(o.gpsLng),
+        gpsLat: Number(o.gpsLat),
+        gpsLng: Number(o.gpsLng),
+        grade: o.grade,
+        overallRating: o.overallRating ? Number(o.overallRating) : null,
+        contactPhone: o.contactPhone,
+        contactEmail: o.contactEmail,
+      })),
     });
-
-    // If no specific outlets are found for this mock route, return some outlets (or all)
-    if (outlets.length === 0) {
-      const allOutlets = await prisma.outlet.findMany({ take: 10 });
-      res.status(200).json({ routeId, routeName: route.name, outlets: allOutlets });
-      return;
-    }
-
-    res.status(200).json({ routeId, routeName: route.name, outlets });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -69,42 +76,26 @@ export const createOrUpdatePlan = async (req: AuthenticatedRequest, res: Respons
     const targetDate = planDate ? new Date(planDate) : new Date();
     targetDate.setHours(0, 0, 0, 0);
 
-    // Check if plan already exists for today
     const existingPlan = await prisma.dailyPlan.findFirst({
-      where: {
-        userId,
-        planDate: targetDate,
-      },
+      where: { userId, planDate: targetDate },
     });
 
-    let plan;
-    if (existingPlan) {
-      // Update existing plan
-      plan = await prisma.dailyPlan.update({
-        where: { id: existingPlan.id },
-        data: {
-          routeId,
-          areaName,
-          plannedVisits,
-        },
-      });
-    } else {
-      // Create new plan
-      plan = await prisma.dailyPlan.create({
-        data: {
-          userId,
-          routeId,
-          areaName,
-          plannedVisits,
-          planDate: targetDate,
-        },
-      });
-    }
+    const plan = existingPlan
+      ? await prisma.dailyPlan.update({
+          where: { id: existingPlan.id },
+          data: { routeId: routeId || null, areaName, plannedVisits },
+        })
+      : await prisma.dailyPlan.create({
+          data: {
+            userId,
+            routeId: routeId || null,
+            areaName,
+            plannedVisits,
+            planDate: targetDate,
+          },
+        });
 
-    res.status(200).json({
-      message: "Daily plan saved successfully",
-      plan,
-    });
+    res.status(200).json({ message: "Daily plan saved successfully", plan });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -123,10 +114,7 @@ export const getTodayPlan = async (req: AuthenticatedRequest, res: Response): Pr
     today.setHours(0, 0, 0, 0);
 
     const plan = await prisma.dailyPlan.findFirst({
-      where: {
-        userId,
-        planDate: today,
-      },
+      where: { userId, planDate: today },
     });
 
     if (!plan) {
@@ -138,15 +126,14 @@ export const getTodayPlan = async (req: AuthenticatedRequest, res: Response): Pr
       return;
     }
 
-    // Load outlets for this plan's area.
-    // In our simplified setup, we can fetch all outlets in this area or just the first few
-    const outlets = await prisma.outlet.findMany({
-      take: 10,
-    });
+    const outlets = plan.routeId
+      ? await prisma.outlet.findMany({
+          where: { routeId: plan.routeId },
+          orderBy: { name: "asc" },
+        })
+      : await prisma.outlet.findMany({ take: 50, orderBy: { name: "asc" } });
 
-    // Check visit status for each outlet today
     const todayStart = new Date(today);
-    todayStart.setHours(0, 0, 0, 0);
     const todayEnd = new Date(today);
     todayEnd.setHours(23, 59, 59, 999);
 
@@ -157,32 +144,38 @@ export const getTodayPlan = async (req: AuthenticatedRequest, res: Response): Pr
       },
     });
 
-    const completedOutletIds = new Set(visits.map((v) => v.outletId));
+    const visitByOutlet = new Map(visits.map((v) => [v.outletId, v]));
 
-    const outletsWithStatus = outlets.map((o) => ({
-      ...o,
-      visitStatus: completedOutletIds.has(o.id) ? "COMPLETED" : "PLANNED",
-      visit: visits.find((v) => v.outletId === o.id) || null,
-    }));
+    const outletsWithStatus = outlets.map((o) => {
+      const visit = visitByOutlet.get(o.id);
+      let visitStatus = "PENDING";
+      if (visit?.checkoutTime) visitStatus = "COMPLETED";
+      else if (visit) visitStatus = "IN_PROGRESS";
 
-    const completedVisits = outletsWithStatus.filter((o) => o.visitStatus === "COMPLETED").length;
+      return {
+        id: o.id,
+        name: o.name,
+        address: o.address,
+        latitude: Number(o.gpsLat),
+        longitude: Number(o.gpsLng),
+        gpsLat: Number(o.gpsLat),
+        gpsLng: Number(o.gpsLng),
+        grade: o.grade,
+        overallRating: o.overallRating ? Number(o.overallRating) : null,
+        visitStatus,
+      };
+    });
 
-    // Update completed count in the daily plan if it has changed
-    if (plan.completedVisits !== completedVisits) {
-      await prisma.dailyPlan.update({
-        where: { id: plan.id },
-        data: { completedVisits },
-      });
-      plan.completedVisits = completedVisits;
-    }
+    const completed = outletsWithStatus.filter((o) => o.visitStatus === "COMPLETED").length;
+    const planned = plan.plannedVisits || outletsWithStatus.length;
 
     res.status(200).json({
       plan,
       outlets: outletsWithStatus,
       progress: {
-        planned: plan.plannedVisits,
-        completed: completedVisits,
-        percentage: plan.plannedVisits > 0 ? Number(((completedVisits / plan.plannedVisits) * 100).toFixed(1)) : 0,
+        planned,
+        completed,
+        percentage: planned > 0 ? Number(((completed / planned) * 100).toFixed(1)) : 0,
       },
     });
   } catch (error: any) {

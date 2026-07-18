@@ -21,7 +21,9 @@ app.get("/health", (req, res) => {
   res.status(200).json({ status: "healthy", timestamp: new Date().toISOString() });
 });
 
-// Register main application routes
+// Spec + mobile client both use /api/v1/*
+app.use("/api/v1", mainRouter);
+// Keep root mount for backward-compatible clients
 app.use("/", mainRouter);
 
 // Register custom error handler
