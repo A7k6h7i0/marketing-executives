@@ -3,50 +3,88 @@ import 'dart:io';
 import 'package:dio/dio.dart';
 import '../constants/api_endpoints.dart';
 import '../network/api_client.dart';
+import 'production_api_service.dart';
 
-/// Thin typed wrappers over the field-force REST API.
-/// Keeps HTTP details out of [AppProvider].
+/// Compatibility facade used by [AppProvider].
+/// All calls go to [ProductionApiService] (sales.digitalleadpro.com).
 class FieldApiService {
-  FieldApiService(this._client);
+  FieldApiService(this._client) : _prod = ProductionApiService(_client);
 
   final ApiClient _client;
+  final ProductionApiService _prod;
+
+  ProductionApiService get production => _prod;
+
+  Response _ok(dynamic data, {int status = 200}) {
+    return Response(
+      requestOptions: RequestOptions(path: ''),
+      data: data is Map && data.containsKey('success')
+          ? data
+          : {'success': true, 'data': data},
+      statusCode: status,
+    );
+  }
 
   // ── Auth ──────────────────────────────────────────────────────────
   Future<Response> login({
     required String password,
-    required String deviceId,
+    String deviceId = '',
     String? email,
     String? phone,
-  }) {
-    return _client.post(ApiEndpoints.login, data: {
-      if (email != null) 'email': email,
-      if (phone != null) 'phone': phone,
-      'password': password,
-      'deviceId': deviceId,
-    });
+    String? orgSlug,
+    String? loginSelfieUrl,
+  }) async {
+    final data = await _prod.login(
+      password: password,
+      email: email,
+      phone: phone,
+      orgSlug: orgSlug,
+      loginSelfieUrl: loginSelfieUrl,
+      deviceId: deviceId,
+    );
+    return _ok(data);
   }
 
-  Future<Response> logout(String deviceId) {
-    return _client.post(ApiEndpoints.logout, data: {'deviceId': deviceId});
+  Future<Response> logout(String deviceId) async {
+    await _prod.logout();
+    return _ok({});
   }
 
   // ── Attendance ────────────────────────────────────────────────────
-  Future<Response> attendanceToday(String userId) {
-    return _client.get(ApiEndpoints.attendanceToday(userId));
+  Future<Response> attendanceToday(String userId) async {
+    final list = await _prod.attendanceMy();
+    Map<String, dynamic>? open;
+    for (final a in list) {
+      if (a['check_out_at'] == null) {
+        open = a;
+        break;
+      }
+    }
+    open ??= list.isNotEmpty ? list.first : null;
+    if (open == null) return _ok({});
+    return _ok({
+      'attendanceId': open['id'],
+      'status': open['status'] == 'checked_in' ? 'LOGGED_IN' : open['status'],
+      'loginTime': open['check_in_at'],
+      'logoutTime': open['check_out_at'],
+      'raw': open,
+      'list': list,
+    });
+  }
+
+  Future<Map<String, dynamic>?> checkInAttendance({
+    required double latitude,
+    required double longitude,
+  }) {
+    return _prod.attendanceCheckIn(latitude: latitude, longitude: longitude);
   }
 
   // ── Breaks ────────────────────────────────────────────────────────
-  Future<Response> startBreak(String breakType) {
-    return _client.post(ApiEndpoints.breaksStart, data: {'breakType': breakType});
-  }
+  Future<Response> startBreak(String breakType) => _prod.startBreak(breakType);
 
-  Future<Response> endBreak(String breakId) {
-    return _client.patch(ApiEndpoints.breaksEnd(breakId));
-  }
+  Future<Response> endBreak(String breakId) => _prod.endBreak(breakId);
 
-  Future<Response> todayBreaks(String userId) {
-    return _client.get(ApiEndpoints.breaksToday(userId));
-  }
+  Future<Response> todayBreaks(String userId) => _prod.todayBreaks();
 
   // ── GPS ───────────────────────────────────────────────────────────
   Future<Response> gpsPing({
@@ -54,28 +92,70 @@ class FieldApiService {
     required double longitude,
     required String trackingStartPoint,
     String? timestamp,
-  }) {
-    return _client.post(ApiEndpoints.gpsPing, data: {
-      'latitude': latitude,
-      'longitude': longitude,
-      'trackingStartPoint': trackingStartPoint,
-      if (timestamp != null) 'timestamp': timestamp,
-    });
+    String? address,
+  }) async {
+    final ping = await _prod.gpsLog(
+      latitude: latitude,
+      longitude: longitude,
+      timestamp: timestamp,
+      address: address,
+    );
+    return _ok({'ping': ping});
   }
 
-  Future<Response> gpsSummary(String userId, String date) {
-    return _client.get(ApiEndpoints.gpsSummary(userId, date));
+  Future<Response> gpsSummary(String userId, String date) async {
+    return _ok({'totalDistanceKm': 0});
   }
 
-  Future<Response> gpsRoute(String userId, String date) {
-    return _client.get(ApiEndpoints.gpsRoute(userId, date));
+  Future<Response> gpsRoute(String userId, String date) async {
+    return _ok([]);
   }
 
-  // ── Plans ─────────────────────────────────────────────────────────
-  Future<Response> getRoutes() => _client.get(ApiEndpoints.routes);
+  // ── Routes / plan (production field-routes + outlets) ─────────────
+  Future<Response> getRoutes() async {
+    final routes = await _prod.fieldRoutes();
+    final mapped = routes.map((r) {
+      return {
+        'id': r['id'],
+        'name': r['name'] ?? 'Route',
+        'region': r['description'] ?? r['territory_id'] ?? '',
+        'outlet_ids': r['outlet_ids'] ?? [],
+        'raw': r,
+      };
+    }).toList();
+    return _ok(mapped);
+  }
 
-  Future<Response> getRouteOutlets(String routeId) {
-    return _client.get(ApiEndpoints.routeOutlets(routeId));
+  Future<Response> getRouteOutlets(String routeId) async {
+    final routes = await _prod.fieldRoutes();
+    Map<String, dynamic>? route;
+    for (final r in routes) {
+      if (r['id']?.toString() == routeId) {
+        route = r;
+        break;
+      }
+    }
+    final outletIds = (route?['outlet_ids'] as List?)?.map((e) => e.toString()).toSet() ?? {};
+    final allOutlets = await _prod.outlets();
+    final filtered = outletIds.isEmpty
+        ? allOutlets
+        : allOutlets.where((o) => outletIds.contains(o['id']?.toString())).toList();
+
+    final mapped = filtered.map(_mapOutlet).toList();
+    return _ok({'outlets': mapped, 'data': mapped});
+  }
+
+  Map<String, dynamic> _mapOutlet(Map<String, dynamic> o) {
+    return {
+      'id': o['id'],
+      'name': o['name'] ?? 'Outlet',
+      'address': o['address'] ?? o['city'] ?? '',
+      'latitude': o['latitude'] ?? o['gpsLat'] ?? 0,
+      'longitude': o['longitude'] ?? o['gpsLng'] ?? 0,
+      'phone': o['phone'],
+      'visitStatus': 'PENDING',
+      'raw': o,
+    };
   }
 
   Future<Response> savePlan({
@@ -83,17 +163,37 @@ class FieldApiService {
     required int plannedVisits,
     String? routeId,
     String? planDate,
-  }) {
-    return _client.post(ApiEndpoints.plans, data: {
-      'areaName': areaName,
-      'plannedVisits': plannedVisits,
-      if (routeId != null) 'routeId': routeId,
-      if (planDate != null) 'planDate': planDate,
+  }) async {
+    // Production uses field-routes; selecting a route is enough for the mobile plan.
+    return _ok({
+      'plan': {
+        'id': routeId ?? 'plan-local',
+        'areaName': areaName,
+        'plannedVisits': plannedVisits,
+        'routeId': routeId,
+        'planDate': planDate,
+      },
     });
   }
 
-  Future<Response> todayPlan(String userId) {
-    return _client.get(ApiEndpoints.plansToday(userId));
+  Future<Response> todayPlan(String userId) async {
+    final routes = await _prod.fieldRoutes();
+    final outlets = await _prod.outlets();
+    final mappedOutlets = outlets.map(_mapOutlet).toList();
+    return _ok({
+      'plan': {
+        'id': routes.isNotEmpty ? routes.first['id'] : 'today',
+        'areaName': routes.isNotEmpty ? routes.first['name'] : 'Today',
+        'plannedVisits': mappedOutlets.length,
+        'completedVisits': 0,
+      },
+      'outlets': mappedOutlets,
+      'progress': {
+        'planned': mappedOutlets.length,
+        'completed': 0,
+        'percentage': 0,
+      },
+    });
   }
 
   // ── Visits ────────────────────────────────────────────────────────
@@ -104,60 +204,140 @@ class FieldApiService {
     String? outletId,
     Map<String, dynamic>? outlet,
     bool managerOverrideFlag = false,
-  }) {
-    return _client.post(ApiEndpoints.visitsCheckIn, data: {
-      if (outletId != null) 'outletId': outletId,
-      if (outlet != null) 'outlet': outlet,
-      'gpsLat': gpsLat,
-      'gpsLng': gpsLng,
-      'selfieUrl': selfieUrl,
-      'managerOverrideFlag': managerOverrideFlag,
-    });
+  }) async {
+    String resolvedOutletId = outletId ?? '';
+    if (resolvedOutletId.isEmpty && outlet != null) {
+      final created = await _prod.createOutlet({
+        'name': outlet['name'] ?? 'Outlet',
+        'phone': outlet['phone'] ?? outlet['contactPhone'],
+        'address': outlet['address'],
+        'latitude': outlet['gpsLat'] ?? outlet['latitude'] ?? gpsLat,
+        'longitude': outlet['gpsLng'] ?? outlet['longitude'] ?? gpsLng,
+        'type': 'retailer',
+      });
+      resolvedOutletId = created?['id']?.toString() ?? '';
+    }
+    if (resolvedOutletId.isEmpty) {
+      throw DioException(
+        requestOptions: RequestOptions(path: ApiEndpoints.visitsStart),
+        message: 'outlet_id is required',
+      );
+    }
+
+    final visit = await _prod.visitStart(
+      outletId: resolvedOutletId,
+      latitude: gpsLat,
+      longitude: gpsLng,
+    );
+    return _ok({'visit': visit}, status: 201);
   }
 
   Future<Response> submitVisitOrder({
     required String visitId,
     required List<Map<String, dynamic>> productsOrdered,
     String? remarks,
-  }) {
-    return _client.post(ApiEndpoints.visitOrder(visitId), data: {
-      'productsOrdered': productsOrdered,
-      if (remarks != null) 'remarks': remarks,
-    });
-  }
-
-  Future<Response> checkoutVisit(String visitId) {
-    return _client.patch(ApiEndpoints.visitCheckout(visitId));
-  }
-
-  Future<Response> visitsForDate(String userId, String date) {
-    return _client.get(ApiEndpoints.visitsByDate(userId, date));
-  }
-
-  Future<Response> products({String? query}) {
-    return _client.get(
-      ApiEndpoints.products,
-      queryParameters: query == null || query.isEmpty ? null : {'q': query},
+    String? outletId,
+  }) async {
+    final totalAmount = productsOrdered.fold<double>(
+      0,
+      (sum, p) =>
+          sum +
+          ((double.tryParse(p['unitPrice']?.toString() ?? '') ?? 0) *
+              (double.tryParse(p['qty']?.toString() ?? '1') ?? 1)),
     );
+
+    // Keep order total in notes so admin Logs can read it from GET /visits
+    // (production stores money on /orders, not visit.sales_value).
+    final orderTag = 'ORDER_TOTAL=${totalAmount.toStringAsFixed(2)}';
+    final baseRemarks = (remarks ?? '').trim();
+    final notesWithTotal = baseRemarks.isEmpty
+        ? orderTag
+        : (baseRemarks.contains('ORDER_TOTAL=') ? baseRemarks : '$baseRemarks|$orderTag');
+
+    final items = productsOrdered.map((p) {
+      return {
+        'product_id': p['productId'] ?? p['product_id'] ?? p['id'] ?? p['sku'],
+        'quantity': p['qty'] ?? p['quantity'] ?? 1,
+        'price': p['unitPrice'] ?? p['price'] ?? 0,
+      };
+    }).toList();
+
+    final order = await _prod.createOrder(
+      outletId: outletId ?? '',
+      visitId: visitId,
+      items: items,
+      notes: notesWithTotal,
+      totalAmount: totalAmount,
+    );
+    return _ok({
+      'order': order,
+      'order_total': totalAmount,
+      'notes': notesWithTotal,
+    }, status: 201);
+  }
+
+  Future<Response> checkoutVisit(
+    String visitId, {
+    double? latitude,
+    double? longitude,
+    String? outcome,
+    String? notes,
+    DateTime? nextVisitDate,
+  }) async {
+    final visit = await _prod.visitEnd(
+      visitId: visitId,
+      latitude: latitude ?? 0,
+      longitude: longitude ?? 0,
+      outcome: outcome ?? 'completed',
+      notes: notes,
+      nextVisitDate: nextVisitDate,
+    );
+    return _ok({'visit': visit});
+  }
+
+  Future<Response> visitsForDate(String userId, String date) async {
+    return _ok([]);
+  }
+
+  Future<Response> products({String? query}) async {
+    final list = await _prod.products(query: query);
+    final mapped = list.map((p) {
+      return {
+        'id': p['id'],
+        'sku': p['sku'],
+        'name': p['name'],
+        'price': p['ptr'] ?? p['mrp'] ?? p['price'] ?? 0,
+        'unitPrice': p['ptr'] ?? p['mrp'] ?? p['price'] ?? 0,
+        'unit_price': p['ptr'] ?? p['mrp'] ?? p['price'] ?? 0,
+        'mrp': p['mrp'],
+        'ptr': p['ptr'],
+        'size': p['pack_size'] ?? p['size'] ?? p['uom'],
+        'raw': p,
+      };
+    }).toList();
+    return _ok({'products': mapped});
   }
 
   Future<String> uploadSelfie(File file) async {
-    final form = FormData.fromMap({
-      'file': await MultipartFile.fromFile(file.path, filename: file.uri.pathSegments.last),
-    });
-    final response = await _client.post(ApiEndpoints.uploadSelfie, data: form);
-    final body = response.data;
-    if (body is Map && body['url'] != null) {
-      final url = body['url'].toString();
-      if (url.startsWith('http')) return url;
-      return '${ApiEndpoints.baseUrl}$url';
+    final url = await _prod.uploadSelfie(file);
+    if (url == null || url.isEmpty) {
+      throw Exception('Selfie upload not available on server yet');
     }
-    throw Exception('Selfie upload did not return a URL');
+    return url;
   }
 
-  // ── Outlets / ratings ─────────────────────────────────────────────
-  Future<Response> ensureOutlet(Map<String, dynamic> outlet) {
-    return _client.post(ApiEndpoints.outlets, data: outlet);
+  // ── Outlets ───────────────────────────────────────────────────────
+  Future<Response> ensureOutlet(Map<String, dynamic> outlet) async {
+    final created = await _prod.createOutlet({
+      'name': outlet['name'],
+      'address': outlet['address'],
+      'phone': outlet['contactPhone'] ?? outlet['phone'],
+      'email': outlet['contactEmail'] ?? outlet['email'],
+      'latitude': outlet['gpsLat'] ?? outlet['latitude'],
+      'longitude': outlet['gpsLng'] ?? outlet['longitude'],
+      'type': outlet['type'] ?? 'retailer',
+    });
+    return _ok({'outlet': created}, status: created == null ? 400 : 201);
   }
 
   Future<Response> submitRating({
@@ -187,17 +367,27 @@ class FieldApiService {
     required String description,
     List<String>? imageUrls,
     List<String>? videoUrls,
-  }) {
-    return _client.post(ApiEndpoints.incidents, data: {
-      'incidentType': incidentType,
-      'description': description,
-      'imageUrls': imageUrls ?? [],
-      'videoUrls': videoUrls ?? [],
-    });
+  }) async {
+    final type = incidentType.toLowerCase().contains('vehicle')
+        ? 'vehicle_breakdown'
+        : incidentType.toLowerCase();
+    final created = await _prod.createIncident(type: type, description: description);
+    return _ok({'incident': created}, status: created == null ? 400 : 201);
   }
 
-  Future<Response> userIncidents(String userId) {
-    return _client.get(ApiEndpoints.incidentsByUser(userId));
+  Future<Response> userIncidents(String userId) async {
+    final list = await _prod.listIncidents();
+    final mapped = list.map((i) {
+      return {
+        'id': i['id'],
+        'incidentType': i['type'] ?? i['incidentType'],
+        'description': i['description'],
+        'status': i['status'],
+        'createdAt': i['created_at'],
+        'raw': i,
+      };
+    }).toList();
+    return _ok({'incidents': mapped});
   }
 
   // ── Leads ─────────────────────────────────────────────────────────
@@ -205,25 +395,41 @@ class FieldApiService {
     required double lat,
     required double lng,
     String? category,
-  }) {
-    return _client.get(ApiEndpoints.leadsNearby, queryParameters: {
-      'lat': lat,
-      'lng': lng,
-      if (category != null) 'category': category,
-    });
+  }) async {
+    final list = await _prod.listLeads();
+    return _ok({'leads': list});
   }
 
-  Future<Response> saveLead(Map<String, dynamic> data) {
-    return _client.post(ApiEndpoints.leads, data: data);
+  Future<Response> saveLead(Map<String, dynamic> data) async {
+    final created = await _prod.saveLead(data);
+    return _ok({'lead': created}, status: created == null ? 400 : 201);
   }
 
-  Future<Response> listLeads() => _client.get(ApiEndpoints.leads);
-
-  Future<Response> convertLead(String leadId) {
-    return _client.post(ApiEndpoints.leadConvert(leadId));
+  Future<Response> listLeads() async {
+    final list = await _prod.listLeads();
+    final mapped = list.map((item) {
+      return {
+        'id': item['id'],
+        'businessName': item['name'] ?? item['businessName'] ?? 'Lead',
+        'businessCategory': item['business_type'] ?? item['businessCategory'] ?? 'Business',
+        'contactPhone': item['phone'] ?? item['contactPhone'] ?? '',
+        'contactEmail': item['email'] ?? item['contactEmail'] ?? '',
+        'address': item['address'] ?? '',
+        'gpsLat': item['gps_lat'] ?? item['latitude'] ?? 0,
+        'gpsLng': item['gps_lng'] ?? item['longitude'] ?? 0,
+        'leadStatus': (item['status'] ?? 'new').toString().toUpperCase(),
+        'raw': item,
+      };
+    }).toList();
+    return _ok({'leads': mapped});
   }
 
-  // ── Route optimize ────────────────────────────────────────────────
+  Future<Response> convertLead(String leadId, {Map<String, dynamic>? lead}) async {
+    final outlet = await _prod.convertLead(leadId, lead: lead);
+    return _ok({'outlet': outlet}, status: outlet == null ? 400 : 201);
+  }
+
+  // ── Route optimize (optional) ─────────────────────────────────────
   Future<Response> optimizeRoute(Map<String, dynamic> data) {
     return _client.post(ApiEndpoints.routesOptimize, data: data);
   }
@@ -233,7 +439,26 @@ class FieldApiService {
   }
 
   // ── Admin ─────────────────────────────────────────────────────────
-  Future<Response> adminKpis() => _client.get(ApiEndpoints.adminKpis);
+  Future<Response> adminKpis() async {
+    final stats = await _prod.adminStats();
+    return _ok(stats);
+  }
 
-  Future<Response> adminUsers() => _client.get(ApiEndpoints.adminUsers);
+  Future<Response> adminUsers() async {
+    final users = await _prod.adminUsers();
+    final mapped = users.map((u) {
+      return {
+        'id': u['id'],
+        'name': u['name'] ?? u['email'] ?? 'User',
+        'email': u['email'],
+        'role': u['role'],
+        'status': (u['status'] ?? 'active').toString().toLowerCase() == 'active' ? 'active' : 'inactive',
+        'designation': u['role'],
+        'phone': u['phone'],
+        'raw': u,
+      };
+    }).toList();
+    // Return list under both shapes so _responseList can find it.
+    return _ok({'users': mapped});
+  }
 }

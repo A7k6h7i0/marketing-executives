@@ -205,6 +205,16 @@ model Product {
   @@map("products")
 }
 
+/// Org-wide field policy (selfie check-in, auto-visit dwell time).
+model AppSetting {
+  id                       String   @id @default("default")
+  selfieRequired           Boolean  @default(false)
+  minVisitDurationMinutes  Int      @default(3)
+  updatedAt                DateTime @updatedAt
+
+  @@map("app_settings")
+}
+
 model DailyPlan {
   id              String            @id @default(uuid()) @db.Uuid
   userId          String            @db.Uuid
@@ -227,7 +237,7 @@ model Visit {
   checkoutTime    DateTime?
   gpsLat          Decimal           @db.Decimal(9, 6)
   gpsLng          Decimal           @db.Decimal(9, 6)
-  selfieUrl       String            @db.VarChar(512)
+  selfieUrl       String            @db.Text
   productsOrdered Json?             // Array of {sku, qty, unit_price}
   salesValue      Decimal           @default(0.00) @db.Decimal(12, 2)
   remarks         String?           @db.VarChar(500)

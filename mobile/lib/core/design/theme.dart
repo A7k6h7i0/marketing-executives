@@ -6,10 +6,19 @@ import 'tokens.dart';
 class BestieTheme {
   static ThemeData light() {
     final base = ThemeData(useMaterial3: true, brightness: Brightness.light);
-    final text = GoogleFonts.interTextTheme(base.textTheme).apply(
-      bodyColor: BestieTokens.cText,
-      displayColor: BestieTokens.cText,
-    );
+    TextTheme text;
+    try {
+      // Runtime font fetch can fail offline / on locked-down networks — fall back safely.
+      text = GoogleFonts.interTextTheme(base.textTheme).apply(
+        bodyColor: BestieTokens.cText,
+        displayColor: BestieTokens.cText,
+      );
+    } catch (_) {
+      text = base.textTheme.apply(
+        bodyColor: BestieTokens.cText,
+        displayColor: BestieTokens.cText,
+      );
+    }
 
     return base.copyWith(
       scaffoldBackgroundColor: BestieTokens.cBg,

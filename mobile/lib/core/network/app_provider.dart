@@ -3,21 +3,28 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
+import 'package:geocoding/geocoding.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:cross_file/cross_file.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'api_client.dart';
 import '../constants/api_endpoints.dart';
 import '../database/database_helper.dart';
 import '../services/field_api_service.dart';
+import '../services/business_data_service.dart';
+import '../services/organisation_registry.dart';
 import '../utils/device_id.dart';
+import '../utils/device_location.dart';
 import '../utils/geo.dart';
 import '../../features/telecaller/data/telecaller_recording_setup.dart';
 
 class AppProvider extends ChangeNotifier {
   final ApiClient _apiClient = ApiClient();
   late final FieldApiService _api = FieldApiService(_apiClient);
+  final BusinessDataService _businessData = BusinessDataService();
   final _uuid = const Uuid();
   Timer? _gpsTrackingTimer;
   double? _lastPingLat;
@@ -25,12 +32,18 @@ class AppProvider extends ChangeNotifier {
 
   // Auth State
   bool _isAuthenticated = false;
+  /// False until startup session restore / token check finishes. AuthGate waits on this.
+  bool _sessionReady = false;
   String? _token;
   String? _userId;
   String? _email;
   String? _phone;
   String? _role;
+  /// Plain password from last successful login (shown on Management Desk). Cleared on logout.
+  String? _loginPassword;
   String? _region;
+  /// Tenant org slug from login (`user.org.slug`) — used for AddPhoneBook exemption.
+  String? _orgSlug;
   bool _isLoading = false;
   String? _loginError;
   bool _telecallerSetupLoaded = false;
@@ -83,11 +96,21 @@ class AppProvider extends ChangeNotifier {
   Map<String, dynamic>? _adminStats;
   List<dynamic> _adminLiveVisitsList = [];
   List<dynamic> _adminLiveGpsList = [];
-  int _minimumVisitDurationMinutes = 2;
+  int _minimumVisitDurationMinutes = 3;
+  bool _selfieRequired = false; // Admin policy; default No
   Timer? _autoVisitTimer;
   String? _dwellOutletId;
   DateTime? _dwellStartedAt;
   Map<String, dynamic>? _lastAutoRegisteredOutlet;
+
+  /// Once-per-day blink selfie for executives entering the field (not login screen).
+  String? _dailyFieldSelfieDate;
+  String? _dailyFieldSelfieUserId;
+  String? _dailyFieldSelfieUrl;
+
+  static const String _prefsDailySelfieDate = 'daily_field_selfie_date';
+  static const String _prefsDailySelfieUser = 'daily_field_selfie_user';
+  static const String _prefsDailySelfieUrl = 'daily_field_selfie_url';
 
   // Premium fallback demo routes (for when backend returns empty data)
   final List<Map<String, dynamic>> _demoRoutes = [
@@ -177,6 +200,7 @@ class AppProvider extends ChangeNotifier {
   // Premium fallback demo catalogs (Module 5 product catalog backup)
   // Getters
   bool get isAuthenticated => _isAuthenticated;
+  bool get isSessionReady => _sessionReady;
   bool get isLoading => _isLoading;
   String? get loginError => _loginError;
 
@@ -192,25 +216,113 @@ class AppProvider extends ChangeNotifier {
     return error['message']?.toString() ?? body['message']?.toString() ?? '';
   }
 
+  /// True when the string looks like a usable login email (catches typos like `.com.com`).
+  static bool isValidLoginEmail(String email) {
+    final e = email.trim().toLowerCase();
+    if (e.isEmpty || !e.contains('@')) return false;
+    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(e)) return false;
+    // Common typo: gmail.com.com / example.in.in
+    if (RegExp(r'\.(com|in|net|org|co|io)\.\1$').hasMatch(e)) return false;
+    return true;
+  }
+
   String _loginFailureMessage(DioException error) {
     final status = error.response?.statusCode;
     final apiMessage = _messageFromApiError(error.response?.data);
+    final raw = '${error.message ?? ''} ${error.response?.data ?? ''}'.toLowerCase();
+    final apiLower = apiMessage.toLowerCase();
+    final code = () {
+      final data = error.response?.data;
+      if (data is Map && data['error'] is Map) {
+        return data['error']['code']?.toString();
+      }
+      return null;
+    }();
 
-    if (status == 401) {
-      return apiMessage.isNotEmpty ? apiMessage : 'Invalid email or password.';
+    if (code == 'SELFIE_REQUIRED' || apiLower.contains('selfie')) {
+      return 'SELFIE_REQUIRED';
+    }
+
+    if (code == 'DEVICE_LOCKED' || apiLower.contains('already active on another device')) {
+      return 'This account is already active on another device. '
+          'Log out there first, or ask your admin to force-logout.';
+    }
+
+    if (status == 402 ||
+        code == 'SUBSCRIPTION_EXPIRED' ||
+        (apiLower.contains('subscription') && apiLower.contains('expired'))) {
+      return ApiClient.subscriptionExpiredUserMessage;
+    }
+
+    final looksLikeAuthFailure = status == 400 ||
+        status == 401 ||
+        status == 403 ||
+        apiLower.contains('invalid') ||
+        apiLower.contains('credential') ||
+        apiLower.contains('password') ||
+        apiLower.contains('unauthorized') ||
+        apiLower.contains('not found') ||
+        apiLower.contains('no user') ||
+        apiLower.contains('user not') ||
+        raw.contains('invalid email') ||
+        raw.contains('invalid credentials');
+
+    if (looksLikeAuthFailure) {
+      // Prefer a clear credentials message over raw server / network wording.
+      if (apiMessage.isNotEmpty &&
+          !apiLower.contains('cannot reach') &&
+          !apiLower.contains('network') &&
+          !apiLower.contains('timeout') &&
+          apiLower != 'invalid request.' &&
+          apiLower != 'invalid request') {
+        return apiMessage;
+      }
+      return 'Invalid email or password.';
+    }
+
+    // Surface Zod field errors instead of the generic "Invalid request."
+    if (apiLower == 'invalid request.' || apiLower == 'invalid request' || code == 'VALIDATION_ERROR') {
+      final details = () {
+        final data = error.response?.data;
+        if (data is Map && data['error'] is Map) {
+          final fieldErrors = data['error']['details']?['fieldErrors'];
+          if (fieldErrors is Map && fieldErrors.isNotEmpty) {
+            final first = fieldErrors.entries.first;
+            final msgs = first.value;
+            final detail = msgs is List && msgs.isNotEmpty ? msgs.first.toString() : msgs.toString();
+            return '${first.key}: $detail';
+          }
+        }
+        return null;
+      }();
+      if (details != null) return 'Login rejected ($details). Please try again.';
+    }
+
+    if (status == 502 ||
+        status == 503 ||
+        status == 504 ||
+        raw.contains('bad gateway') ||
+        raw.contains('status code of 502') ||
+        raw.contains('status code of 503') ||
+        raw.contains('status code of 504')) {
+      return 'Server is temporarily down (${status ?? 502}). '
+          'Cannot reach ${ApiEndpoints.baseUrl} — restart/redeploy the backend, then try again.';
     }
     if (status == 500) {
-      return 'Production server error (500). The login API is down — ask your friend to check the server.';
+      return 'Production server error (500). The login API is down — check the backend service.';
     }
     if (error.type == DioExceptionType.connectionError ||
-        error.type == DioExceptionType.connectionTimeout) {
+        error.type == DioExceptionType.connectionTimeout ||
+        error.type == DioExceptionType.receiveTimeout) {
       return 'Cannot reach ${ApiEndpoints.baseUrl}. Check your internet connection.';
     }
     if (apiMessage.isNotEmpty) return apiMessage;
-    return error.message ?? 'Login failed. Please try again.';
+    // Never show raw Dio stack text to the user.
+    return 'Login failed (HTTP ${status ?? 'network'}). Please try again.';
   }
   String? get userId => _userId;
   String? get email => _email;
+  String? get loginPassword => _loginPassword;
   String? get phone => _phone;
   String? get role => _role;
   String? get region => _region;
@@ -235,6 +347,96 @@ class AppProvider extends ChangeNotifier {
   List<dynamic> get routeOutlets => _routeOutlets;
   Map<String, dynamic>? get todayPlan => _todayPlan;
   List<dynamic> get plannedOutlets => _plannedOutlets;
+  List<dynamic> get pendingPlanOutlets {
+    final seenNames = <String>{};
+    final out = <dynamic>[];
+    for (final o in _plannedOutlets) {
+      if (o is! Map || o['visitStatus'] == 'COMPLETED') continue;
+      final name = (o['name'] ?? '').toString().trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+      final id = o['id']?.toString() ?? '';
+      if (id.isNotEmpty) {
+        // Prefer id uniqueness among pending
+      }
+      if (name.isNotEmpty && !seenNames.add(name)) continue;
+      out.add(o);
+    }
+    return out;
+  }
+  List<dynamic> get visitedPlanOutlets => _plannedOutlets
+      .where((o) => o is Map && o['visitStatus'] == 'COMPLETED')
+      .toList();
+
+  /// Quick-remark chips used at checkout (keep in sync with Home UI).
+  static const List<String> quickRemarkKeywords = [
+    'Next Visit',
+    'Payment received',
+    'Payment pending',
+    'Order placed last week',
+    'Visit again next week',
+  ];
+
+  /// Visited tab: completed visits + next-visit scheduled + any quick remarks.
+  List<dynamic> get visitedRemarkOutlets {
+    final byId = <String, Map<String, dynamic>>{};
+    for (final o in _plannedOutlets) {
+      if (o is! Map) continue;
+      final map = Map<String, dynamic>.from(o);
+      final id = map['id']?.toString() ?? '';
+      if (id.isEmpty) continue;
+      final completed = map['visitStatus'] == 'COMPLETED';
+      final hasNext = (map['nextVisitDate']?.toString() ?? '').isNotEmpty &&
+          DateTime.tryParse(map['nextVisitDate'].toString()) != null;
+      final remarks = (map['visitRemarks'] ?? map['remarks'] ?? '').toString().trim();
+      final hasRemarkKeyword = quickRemarkKeywords.any(
+        (k) => remarks.toLowerCase().contains(k.toLowerCase()),
+      );
+      if (completed || hasNext || hasRemarkKeyword || remarks.isNotEmpty) {
+        byId[id] = map;
+      }
+    }
+    final list = byId.values.toList();
+    list.sort((a, b) {
+      final ca = a['visitStatus'] == 'COMPLETED' ? 0 : 1;
+      final cb = b['visitStatus'] == 'COMPLETED' ? 0 : 1;
+      if (ca != cb) return ca.compareTo(cb);
+      return (a['name']?.toString() ?? '').compareTo(b['name']?.toString() ?? '');
+    });
+    return list;
+  }
+
+  /// Filter [visitedRemarkOutlets] by a quick-remark keyword (or next-visit date).
+  List<dynamic> visitedOutletsForRemark(String? keyword) {
+    final all = visitedRemarkOutlets;
+    if (keyword == null || keyword.isEmpty || keyword.toLowerCase() == 'all') {
+      return all;
+    }
+    final key = keyword.toLowerCase();
+    return all.where((o) {
+      if (o is! Map) return false;
+      if (key == 'next visit') {
+        final next = o['nextVisitDate']?.toString() ?? '';
+        if (next.isNotEmpty && DateTime.tryParse(next) != null) return true;
+      }
+      final remarks = (o['visitRemarks'] ?? o['remarks'] ?? '').toString().toLowerCase();
+      return remarks.contains(key);
+    }).toList();
+  }
+
+  /// Matched quick-remark labels for an outlet (for blue chips in Visited).
+  static List<String> remarkChipsForOutlet(Map<String, dynamic> outlet) {
+    final remarks = (outlet['visitRemarks'] ?? outlet['remarks'] ?? '').toString();
+    final chips = <String>[];
+    for (final k in quickRemarkKeywords) {
+      if (remarks.toLowerCase().contains(k.toLowerCase())) {
+        chips.add(k);
+      }
+    }
+    final next = outlet['nextVisitDate']?.toString() ?? '';
+    if (next.isNotEmpty && DateTime.tryParse(next) != null && !chips.contains('Next Visit')) {
+      chips.insert(0, 'Next Visit');
+    }
+    return chips;
+  }
   int get plannedVisitsCount => _plannedVisitsCount;
   int get completedVisitsCount => _completedVisitsCount;
   double get planProgressPercentage => _planProgressPercentage;
@@ -251,10 +453,189 @@ class AppProvider extends ChangeNotifier {
   List<dynamic> get userIncidents => _userIncidents;
   List<dynamic> get adminUsersList => _adminUsersList;
   Map<String, dynamic>? get adminStats => _adminStats;
+
+  /// Current org subscription from GET /admin/org or admin stats.
+  Map<String, dynamic>? _orgSubscription;
+  Map<String, dynamic>? get orgSubscription => _orgSubscription;
+
+  String? get subscriptionStatus =>
+      _orgSubscription?['subscription_status']?.toString() ??
+      (_adminStats?['org'] is Map
+          ? (_adminStats!['org'] as Map)['subscription_status']?.toString()
+          : null);
+
+  DateTime? get trialEndsAt {
+    final raw = _orgSubscription?['trial_ends_at'] ??
+        (_adminStats?['org'] is Map ? (_adminStats!['org'] as Map)['trial_ends_at'] : null);
+    return DateTime.tryParse(raw?.toString() ?? '');
+  }
+
+  DateTime? get gracePeriodEndsAt {
+    final raw = _orgSubscription?['grace_period_ends_at'] ??
+        (_adminStats?['org'] is Map ? (_adminStats!['org'] as Map)['grace_period_ends_at'] : null);
+    return DateTime.tryParse(raw?.toString() ?? '');
+  }
+
+  bool get _isPlatformSuperAdmin =>
+      (_role ?? '').toLowerCase() == 'super_admin' ||
+      (_role ?? '').toLowerCase() == 'superadmin';
+
+  /// Platform owner org — never show trial banner or apply client lock.
+  bool get _isAddPhoneBookOrg {
+    final slug = (_orgSlug ??
+            _orgSubscription?['slug']?.toString() ??
+            (_adminStats?['org'] is Map ? (_adminStats!['org'] as Map)['slug'] : null) ??
+            '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    if (slug == 'addphonebook') return true;
+    final email = (_email ?? '').toLowerCase();
+    if (email.endsWith('@addphonebook.com')) return true;
+    final orgName = (_orgSubscription?['name'] ??
+            (_adminStats?['org'] is Map ? (_adminStats!['org'] as Map)['name'] : null) ??
+            '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    return orgName == 'addphonebook';
+  }
+
+  /// Super admin + AddPhoneBook members are never gated by trial/grace in the app.
+  bool get _isExemptFromSubscriptionGate =>
+      _isPlatformSuperAdmin || _isAddPhoneBookOrg;
+
+  static String _fmtSubDate(DateTime dt) {
+    final local = dt.toLocal();
+    final dd = local.day.toString().padLeft(2, '0');
+    final mm = local.month.toString().padLeft(2, '0');
+    return '$dd/$mm/${local.year}';
+  }
+
+  /// True when server stamped grace has passed (client-side helper; server enforces 402).
+  bool get isPastGracePeriod {
+    if (_isExemptFromSubscriptionGate) return false;
+    final end = gracePeriodEndsAt;
+    if (end == null) return false;
+    return DateTime.now().toUtc().isAfter(end.toUtc());
+  }
+
+  bool get isInGracePeriod {
+    if (_isExemptFromSubscriptionGate) return false;
+    final trial = trialEndsAt;
+    final grace = gracePeriodEndsAt;
+    if (trial == null || grace == null) return false;
+    final now = DateTime.now().toUtc();
+    return now.isAfter(trial.toUtc()) && !now.isAfter(grace.toUtc());
+  }
+
+  /// Tenant orgs only (not super admin, not AddPhoneBook).
+  String? get subscriptionBannerText {
+    if (_isExemptFromSubscriptionGate) return null;
+
+    final status = (subscriptionStatus ?? '').toLowerCase();
+    final trial = trialEndsAt;
+    final grace = gracePeriodEndsAt;
+    if (status.isEmpty && trial == null && grace == null) return null;
+
+    if (isPastGracePeriod || status == 'expired' || status == 'suspended') {
+      final graceLabel = grace != null ? ' (ended ${_fmtSubDate(grace)})' : '';
+      return 'Subscription expired$graceLabel — payment required to restore access.';
+    }
+    if (isInGracePeriod && grace != null) {
+      return 'Grace period — access locks on ${_fmtSubDate(grace)}. '
+          'Trial ended ${trial != null ? _fmtSubDate(trial) : 'earlier'}. Pay to continue.';
+    }
+    if (trial != null && grace != null) {
+      return 'Free trial until ${_fmtSubDate(trial)}. '
+          'Grace until ${_fmtSubDate(grace)} (access locks after that). '
+          'Status: ${subscriptionStatus ?? 'trialing'}';
+    }
+    if (trial != null) {
+      return 'Free trial until ${_fmtSubDate(trial)} (then 3-day grace). '
+          'Status: ${subscriptionStatus ?? 'trialing'}';
+    }
+    if (grace != null) {
+      return 'Access until ${_fmtSubDate(grace)}. Status: ${subscriptionStatus ?? 'trialing'}';
+    }
+    if (status == 'trialing') {
+      return 'Free trial active — expiry dates not returned by server yet. Pull to refresh, or ask platform to stamp trial/grace dates.';
+    }
+    if (status == 'active') return 'Subscription active.';
+    return 'Subscription: ${subscriptionStatus ?? 'unknown'}';
+  }
+
+  String? _lastApproveSubscriptionSummary;
+  String? get lastApproveSubscriptionSummary => _lastApproveSubscriptionSummary;
+
+  /// Clears lock flag set by Dio when API returns 402 SUBSCRIPTION_EXPIRED.
+  Future<String?> consumeSubscriptionLockMessage() async {
+    // Platform super admin + AddPhoneBook never lock out.
+    if (_isExemptFromSubscriptionGate) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove('subscription_locked');
+      await prefs.remove('subscription_lock_message');
+      ApiClient.subscriptionLockedNotifier.value = false;
+      return null;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    if (prefs.getBool('subscription_locked') != true &&
+        !ApiClient.subscriptionLockedNotifier.value) {
+      return null;
+    }
+    final msg = prefs.getString('subscription_lock_message') ??
+        ApiClient.subscriptionExpiredUserMessage;
+    await prefs.remove('subscription_locked');
+    await prefs.remove('subscription_lock_message');
+    ApiClient.subscriptionLockedNotifier.value = false;
+    _token = null;
+    _isAuthenticated = false;
+    _loginError = msg;
+    notifyListeners();
+    return msg;
+  }
+
+  /// Called when mid-session API returns 402 — drop session and show login.
+  Future<void> forceLogoutForExpiredSubscription() async {
+    if (_isExemptFromSubscriptionGate) {
+      ApiClient.subscriptionLockedNotifier.value = false;
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove('subscription_locked');
+      await prefs.remove('subscription_lock_message');
+      return;
+    }
+    await consumeSubscriptionLockMessage();
+  }
   List<dynamic> get adminLiveVisitsList => _adminLiveVisitsList;
   List<dynamic> get adminLiveGpsList => _adminLiveGpsList;
   int get minimumVisitDurationMinutes => _minimumVisitDurationMinutes;
+  bool get selfieRequired => _selfieRequired;
   Map<String, dynamic>? get lastAutoRegisteredOutlet => _lastAutoRegisteredOutlet;
+  String? get authToken => _token;
+
+  /// Backend login selfie for executives — once per calendar day (no second dashboard prompt).
+  bool get hasCompletedLoginSelfieToday =>
+      _isExecutiveRole() &&
+      _dailyFieldSelfieDate == _todayDateKey() &&
+      _dailyFieldSelfieUserId == _userId;
+
+  /// Cached login selfie URL/data-URI for today (reuse if server asks again same day).
+  String? get todaysLoginSelfieUrl {
+    if (_dailyFieldSelfieDate != _todayDateKey() ||
+        _dailyFieldSelfieUserId != _userId) {
+      return null;
+    }
+    final url = (_dailyFieldSelfieUrl ?? '').trim();
+    return url.isEmpty ? null : url;
+  }
+
+  @Deprecated('Use hasCompletedLoginSelfieToday')
+  bool get hasCompletedDailyFieldSelfieToday => hasCompletedLoginSelfieToday;
+
+  @Deprecated('Dashboard daily selfie removed — login selfie only')
+  bool get needsDailyFieldSelfie => false;
+
+  String? get dailyFieldSelfieUrl => _dailyFieldSelfieUrl;
 
   AppProvider() {
     _loadSavedSession();
@@ -263,33 +644,89 @@ class AppProvider extends ChangeNotifier {
   // Load session from SharedPreferences on startup
   Future<void> _loadSavedSession() async {
     final prefs = await SharedPreferences.getInstance();
-    _token = prefs.getString('jwt_token');
-    _userId = prefs.getString('user_id');
-    _email = prefs.getString('user_email');
-    _phone = prefs.getString('user_phone');
-    _role = prefs.getString('user_role');
-    _region = prefs.getString('user_region');
-    _minimumVisitDurationMinutes = prefs.getInt('minimum_visit_duration_minutes') ?? 2;
+    try {
+      _token = prefs.getString('jwt_token');
+      _userId = prefs.getString('user_id');
+      _email = prefs.getString('user_email');
+      _phone = prefs.getString('user_phone');
+      _role = prefs.getString('user_role');
+      _loginPassword = prefs.getString('user_login_password');
+      _region = prefs.getString('user_region');
+      _orgSlug = prefs.getString('user_org_slug');
+      _minimumVisitDurationMinutes = prefs.getInt('minimum_visit_duration_minutes') ?? 3;
+      _selfieRequired = prefs.getBool('selfie_required') ?? false;
+      _dailyFieldSelfieDate = prefs.getString(_prefsDailySelfieDate);
+      _dailyFieldSelfieUserId = prefs.getString(_prefsDailySelfieUser);
+      _dailyFieldSelfieUrl = prefs.getString(_prefsDailySelfieUrl);
 
-    await TelecallerRecordingSetup.load();
-    _telecallerSetupComplete = TelecallerRecordingSetup.isComplete;
-    _telecallerSetupLoaded = true;
+      await TelecallerRecordingSetup.load();
+      _telecallerSetupComplete = TelecallerRecordingSetup.isComplete;
+      _telecallerSetupLoaded = true;
 
-    if (_token != null && _token!.isNotEmpty) {
+      // One-time security reset: older installs may still have a leftover JWT (e.g. super_admin).
+      // After this build, require an explicit login once; later opens keep that account.
+      const secureSessionFlag = 'secure_session_v1';
+      if (prefs.getBool(secureSessionFlag) != true) {
+        await _clearAuthPrefs(prefs);
+        await prefs.setBool(secureSessionFlag, true);
+        return;
+      }
+
+      // Drop stale demo / local-backend sessions — never auto-login as alpha.com users.
+      final savedEmail = (_email ?? '').toLowerCase().trim();
+      if (savedEmail.endsWith('@alpha.com') ||
+          savedEmail == 'exec@alpha.com' ||
+          savedEmail == 'admin@alpha.com' ||
+          savedEmail.endsWith('@fieldforce.com')) {
+        await _clearAuthPrefs(prefs);
+        return;
+      }
+
+      // Incomplete / corrupt session → force login (never open a dashboard half-logged-in).
+      if (_token == null ||
+          _token!.isEmpty ||
+          _userId == null ||
+          _userId!.isEmpty ||
+          _role == null ||
+          _role!.isEmpty) {
+        await _clearAuthPrefs(prefs);
+        return;
+      }
+
+      // Verify JWT with the server before trusting a restored session (security).
+      final valid = await _validateStoredSession();
+      if (!valid) {
+        await _clearAuthPrefs(prefs);
+        return;
+      }
+
       _isAuthenticated = true;
       notifyListeners();
-      
-      if (_role == 'admin' ||
-          _role == 'manager' ||
-          _role == 'SUPER_ADMIN' ||
-          _role == 'REGIONAL_MANAGER' ||
-          _role == 'SALES_MANAGER') {
+      await fetchFieldSettings();
+
+      if (_role?.toUpperCase() == 'TELECALLER') {
+        // no-op
+      } else if (_isAdminRole()) {
         fetchAdminDashboardData();
       } else {
         await _restoreTodayPlanFromLocal();
         await _restoreLocalAttendance();
         await _restoreTodayBreaksFromLocal();
+        await _restoreTodayDistance();
+        await _recomputeTodayDistanceFromLocalGps();
+        // Re-ask / refresh GPS on app reopen so tracking continues for executives.
+        final access = await DeviceLocation.ensureAccess();
+        if (access == LocationAccessResult.granted) {
+          final pos = await DeviceLocation.resolvePosition(
+            timeLimit: const Duration(seconds: 10),
+            requestIfNeeded: false,
+          );
+          if (pos != null) {
+            await recordGpsPing(pos.latitude, pos.longitude, _odometerStartPoint, address: 'Session resume');
+          }
+        }
         fetchTodayLiveSummary();
+        fetchAvailableRoutes();
         fetchTodayPlan();
         restoreActiveVisitFromLocalDb();
         fetchProductCatalog();
@@ -297,43 +734,217 @@ class AppProvider extends ChangeNotifier {
         fetchUserIncidents();
         startContinuousGpsTracking();
       }
+    } finally {
+      _sessionReady = true;
+      notifyListeners();
     }
   }
 
+  Future<void> _clearAuthPrefs(SharedPreferences prefs) async {
+    await prefs.remove('jwt_token');
+    await prefs.remove('user_id');
+    await prefs.remove('user_email');
+    await prefs.remove('user_phone');
+    await prefs.remove('user_role');
+    await prefs.remove('user_region');
+    await prefs.remove('user_org_slug');
+    await prefs.remove('user_login_password');
+    _token = null;
+    _userId = null;
+    _email = null;
+    _phone = null;
+    _role = null;
+    _loginPassword = null;
+    _region = null;
+    _orgSlug = null;
+    _isAuthenticated = false;
+  }
+
+  /// Confirms the stored JWT is still accepted by production before auto-entering the app.
+  Future<bool> _validateStoredSession() async {
+    try {
+      final response = await _apiClient.get(ApiEndpoints.authMe);
+      final status = response.statusCode ?? 0;
+      if (status == 401 || status == 403) {
+        return false;
+      }
+      if (status >= 200 && status < 300) {
+        final data = _responseData(response);
+        final user = _mapFrom(data['user']).isNotEmpty ? _mapFrom(data['user']) : data;
+        if (user.isNotEmpty) {
+          final id = user['id']?.toString();
+          final email = user['email']?.toString();
+          final role = user['role']?.toString();
+          final phone = user['phone']?.toString();
+          final prefs = await SharedPreferences.getInstance();
+          if (id != null && id.isNotEmpty) {
+            _userId = id;
+            await prefs.setString('user_id', id);
+          }
+          if (email != null && email.isNotEmpty) {
+            _email = email;
+            await prefs.setString('user_email', email);
+          }
+          if (role != null && role.isNotEmpty) {
+            _role = role;
+            await prefs.setString('user_role', role);
+          }
+          if (phone != null) {
+            _phone = phone;
+            await prefs.setString('user_phone', phone);
+          }
+          final org = _mapFrom(user['org']);
+          final slug = org['slug']?.toString();
+          if (slug != null && slug.isNotEmpty) {
+            _orgSlug = slug;
+            await prefs.setString('user_org_slug', slug);
+          }
+        }
+        return _userId != null && _role != null && _token != null;
+      }
+      // /auth/me not available (404) — allow resume only with a complete local session.
+      return _token != null &&
+          _token!.isNotEmpty &&
+          _userId != null &&
+          _role != null;
+    } on DioException catch (e) {
+      final status = e.response?.statusCode;
+      if (status == 401 || status == 403) return false;
+      // Offline / timeouts: keep last good session for field use.
+      return _token != null &&
+          _token!.isNotEmpty &&
+          _userId != null &&
+          _role != null;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Map<String, dynamic> _responseData(Response response) {
+    final body = _mapFrom(response.data);
+    final nested = _mapFrom(body['data']);
+    return nested.isNotEmpty ? nested : body;
+  }
+
+  List<dynamic> _responseList(Response response, [String? key]) {
+    final body = _mapFrom(response.data);
+    final nested = body['data'] is Map ? _mapFrom(body['data']) : <String, dynamic>{};
+
+    List<dynamic>? asList(dynamic v) => v is List ? v : null;
+
+    if (key != null) {
+      final keyed = asList(body[key]) ?? asList(nested[key]);
+      if (keyed != null) return keyed;
+    }
+    return asList(body['data']) ??
+        asList(nested['users']) ??
+        asList(body['users']) ??
+        asList(body['routes']) ??
+        asList(nested['routes']) ??
+        asList(body['outlets']) ??
+        asList(nested['outlets']) ??
+        asList(body['products']) ??
+        asList(nested['products']) ??
+        asList(body['incidents']) ??
+        asList(nested['incidents']) ??
+        asList(body['leads']) ??
+        asList(nested['leads']) ??
+        const [];
+  }
+
+  bool _isAdminRole([String? role]) {
+    final r = (role ?? _role ?? '').toLowerCase();
+    return r == 'super_admin' ||
+        r == 'admin' ||
+        r == 'manager' ||
+        r == 'super_admin' ||
+        r == 'regional_manager' ||
+        r == 'sales_manager' ||
+        r == 'superadmin';
+  }
+
+  bool _isExecutiveRole([String? role]) {
+    final r = (role ?? _role ?? '').toLowerCase();
+    return r == 'executive' || r == 'sales_executive';
+  }
+
+  /// Platform super-admins (e.g. Lakshmiraj) must never appear in org Team/Logs.
+  bool _isHiddenFromOrgActivity({
+    String? role,
+    String? name,
+    String? email,
+  }) {
+    final r = (role ?? '').toLowerCase().trim();
+    if (r == 'super_admin' || r == 'superadmin') return true;
+    final blob = '${name ?? ''} ${email ?? ''}'.toLowerCase();
+    if (blob.contains('lakshmiraj')) return true;
+    return false;
+  }
+
+  static const String dailyLoginOutletName = 'Daily Field Login';
+  static const String dailyLoginNotesPrefix = 'DAILY_FIELD_LOGIN';
+
+  bool _isSystemDailyLoginOutlet(Map outlet) {
+    final name = (outlet['name'] ?? '').toString().trim().toLowerCase();
+    return name == dailyLoginOutletName.toLowerCase();
+  }
+
+  /// Product catalog mutations require org admin on the API (not manager).
+  bool get canManageProductCatalog {
+    final r = (_role ?? '').toLowerCase();
+    return r == 'admin';
+  }
+
+  bool get isManagerRole {
+    final r = (_role ?? '').toLowerCase();
+    return r == 'manager' || r == 'sales_manager' || r == 'regional_manager';
+  }
+
   // 1. Authentication Methods
-  Future<bool> login(String emailOrPhone, String password, String deviceId) async {
+  Future<bool> login(
+    String emailOrPhone,
+    String password,
+    String deviceId, {
+    String? loginSelfieUrl,
+    String? orgSlug,
+  }) async {
     _isLoading = true;
     _loginError = null;
     notifyListeners();
 
     try {
       final isEmail = emailOrPhone.contains('@');
+      if (isEmail && !isValidLoginEmail(emailOrPhone)) {
+        _loginError = 'Invalid email address. Check for typos (e.g. .com.com).';
+        _isLoading = false;
+        notifyListeners();
+        return false;
+      }
       final resolvedDeviceId = deviceId.isNotEmpty ? deviceId : await DeviceId.get();
       final response = await _api.login(
         password: password,
-        deviceId: resolvedDeviceId,
         email: isEmail ? emailOrPhone.trim() : null,
         phone: isEmail ? null : emailOrPhone.trim(),
+        deviceId: resolvedDeviceId,
+        orgSlug: (orgSlug != null && orgSlug.trim().isNotEmpty) ? orgSlug.trim() : null,
+        loginSelfieUrl: loginSelfieUrl,
       );
 
       if (response.statusCode == 200) {
         final prefs = await SharedPreferences.getInstance();
-        final body = _mapFrom(response.data);
-        final nested = _mapFrom(body['data']);
-        final user = _mapFrom(nested['user']);
-        if (user.isEmpty) {
-          user.addAll(_mapFrom(body['user']));
-        }
+        final payload = _responseData(response);
+        final user = _mapFrom(payload['user']);
 
-        _token = nested['access_token']?.toString() ??
-            body['token']?.toString() ??
-            nested['token']?.toString();
+        _token = payload['access_token']?.toString() ?? payload['token']?.toString();
         _userId = user['id']?.toString();
         _email = user['email']?.toString();
         _phone = user['phone']?.toString();
         _role = user['role']?.toString();
-        _region = user['org_id']?.toString() ?? user['region']?.toString();
-        _activeAttendanceId = body['attendanceId']?.toString() ?? nested['attendanceId']?.toString();
+        _region = user['org_id']?.toString() ??
+            _mapFrom(user['org'])['id']?.toString() ??
+            user['region']?.toString();
+        _orgSlug = _mapFrom(user['org'])['slug']?.toString() ??
+            (orgSlug != null && orgSlug.trim().isNotEmpty ? orgSlug.trim().toLowerCase() : null);
 
         if (_token == null || _userId == null || _role == null) {
           throw Exception('Invalid login response from server');
@@ -344,7 +955,14 @@ class AppProvider extends ChangeNotifier {
         if (_email != null) await prefs.setString('user_email', _email!);
         if (_phone != null) await prefs.setString('user_phone', _phone!);
         await prefs.setString('user_role', _role!);
+        _loginPassword = password;
+        await prefs.setString('user_login_password', password);
         if (_region != null) await prefs.setString('user_region', _region!);
+        if (_orgSlug != null && _orgSlug!.isNotEmpty) {
+          await prefs.setString('user_org_slug', _orgSlug!);
+        } else {
+          await prefs.remove('user_org_slug');
+        }
         await prefs.setString('device_fingerprint', resolvedDeviceId);
 
         await TelecallerRecordingSetup.load();
@@ -353,21 +971,75 @@ class AppProvider extends ChangeNotifier {
 
         _isAuthenticated = true;
         _isLoading = false;
-        // Login creates the attendance session on the server.
-        _startAttendanceClock(DateTime.now().toUtc());
         notifyListeners();
+        await fetchFieldSettings();
 
-        // Load today's role-specific data
-        if (_role == 'TELECALLER') {
-          // Telecaller dashboard / onboarding loads its own data
-        } else if (_role == 'SUPER_ADMIN' ||
-            _role == 'REGIONAL_MANAGER' ||
-            _role == 'SALES_MANAGER' ||
-            _role == 'admin' ||
-            _role == 'manager') {
+        if (_role?.toUpperCase() == 'TELECALLER') {
+          // Telecaller loads its own data
+        } else if (_isAdminRole()) {
+          // Platform/org admins: no GPS / attendance check-in at login.
           fetchAdminDashboardData();
-        } else if (_role == 'executive' || _role == 'SALES_EXECUTIVE') {
+        } else {
+          // Field executive: require real GPS, start attendance + continuous tracking.
+          final access = await DeviceLocation.ensureAccess();
+          if (access != LocationAccessResult.granted) {
+            _loginError = 'Location permission is required for executive login. Allow Location and try again.';
+            _isAuthenticated = false;
+            _token = null;
+            await prefs.remove('jwt_token');
+            _isLoading = false;
+            notifyListeners();
+            return false;
+          }
+
+          final pos = await DeviceLocation.resolvePosition(
+            timeLimit: const Duration(seconds: 12),
+            requestIfNeeded: false,
+          );
+          if (pos == null) {
+            _loginError = 'Could not read GPS. Turn on Location and try login again.';
+            _isAuthenticated = false;
+            _token = null;
+            await prefs.remove('jwt_token');
+            _isLoading = false;
+            notifyListeners();
+            return false;
+          }
+
+          try {
+            await _api.checkInAttendance(latitude: pos.latitude, longitude: pos.longitude);
+          } catch (e) {
+            print('Attendance check-in failed: $e');
+          }
+
+          String? address;
+          try {
+            // Lightweight reverse lookup for admin Logs display.
+            final places = await placemarkFromCoordinates(pos.latitude, pos.longitude);
+            if (places.isNotEmpty) {
+              final p = places.first;
+              address = [
+                p.name,
+                p.subLocality,
+                p.locality,
+                p.administrativeArea,
+              ].where((s) => (s ?? '').toString().trim().isNotEmpty).join(', ');
+            }
+          } catch (_) {}
+
+          await recordGpsPing(
+            pos.latitude,
+            pos.longitude,
+            _odometerStartPoint,
+            address: address?.isNotEmpty == true ? address : 'Login location',
+          );
+
+          _startAttendanceClock(DateTime.now().toUtc());
+          await _restoreTodayPlanFromLocal();
+          await _restoreTodayDistance();
+          await _recomputeTodayDistanceFromLocalGps();
           fetchTodayLiveSummary();
+          fetchAvailableRoutes();
           fetchTodayPlan();
           fetchProductCatalog();
           fetchSavedLeads();
@@ -419,7 +1091,34 @@ class AppProvider extends ChangeNotifier {
     final keepLastMs = TelecallerRecordingSetup.lastUploadedModifiedMs;
 
     final prefs = await SharedPreferences.getInstance();
+    // Preserve organisation registration vault across logout (super-admin needs history).
+    final orgRegistry = prefs.getString(OrganisationRegistry.prefsKey);
+    // Keep once-per-day field selfie so re-login same day does not re-ask.
+    final keepSelfieDate = prefs.getString(_prefsDailySelfieDate);
+    final keepSelfieUser = prefs.getString(_prefsDailySelfieUser);
+    final keepSelfieUrl = prefs.getString(_prefsDailySelfieUrl);
+    // Keep one-time security migration flag so logout does not force wipe on next cold start.
+    const secureSessionFlag = 'secure_session_v1';
+    final keepSecureFlag = prefs.getBool(secureSessionFlag) == true;
     await prefs.clear();
+    if (orgRegistry != null && orgRegistry.isNotEmpty) {
+      await prefs.setString(OrganisationRegistry.prefsKey, orgRegistry);
+    }
+    if (keepSelfieDate != null && keepSelfieDate.isNotEmpty) {
+      await prefs.setString(_prefsDailySelfieDate, keepSelfieDate);
+    }
+    if (keepSelfieUser != null && keepSelfieUser.isNotEmpty) {
+      await prefs.setString(_prefsDailySelfieUser, keepSelfieUser);
+    }
+    if (keepSelfieUrl != null && keepSelfieUrl.isNotEmpty) {
+      await prefs.setString(_prefsDailySelfieUrl, keepSelfieUrl);
+    }
+    if (keepSecureFlag) {
+      await prefs.setBool(secureSessionFlag, true);
+    }
+    _dailyFieldSelfieDate = keepSelfieDate;
+    _dailyFieldSelfieUserId = keepSelfieUser;
+    _dailyFieldSelfieUrl = keepSelfieUrl;
     await TelecallerRecordingSetup.reset();
 
     if (keepPath != null && keepPath.isNotEmpty) {
@@ -443,6 +1142,7 @@ class AppProvider extends ChangeNotifier {
     _email = null;
     _phone = null;
     _role = null;
+    _loginPassword = null;
     _region = null;
     _activeAttendanceId = null;
     _attendanceStatus = 'ABSENT';
@@ -657,14 +1357,173 @@ class AppProvider extends ChangeNotifier {
   }
 
   Future<bool> checkInAttendance(double lat, double lng, {double accuracy = 8.5}) async {
-    // Spec: attendance session starts at login. Refresh live summary instead of a
-    // separate check-in endpoint.
+    try {
+      final result = await _api.checkInAttendance(latitude: lat, longitude: lng);
+      if (result != null && result['id'] != null) {
+        _activeAttendanceId = result['id'].toString();
+      }
+    } catch (e) {
+      print('Production attendance check-in: $e');
+    }
     if (_attendanceStatus != 'LOGGED_IN' && _attendanceStatus != 'PRESENT') {
       _startAttendanceClock(DateTime.now().toUtc());
     }
     await fetchTodayLiveSummary();
     startContinuousGpsTracking();
     return true;
+  }
+
+  /// Server already accepted login without asking for selfie (done for today on backend).
+  Future<void> markLoginSelfieSatisfiedByServer() async {
+    if (!_isExecutiveRole() || _userId == null) return;
+    _dailyFieldSelfieDate = _todayDateKey();
+    _dailyFieldSelfieUserId = _userId;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_prefsDailySelfieDate, _dailyFieldSelfieDate!);
+    await prefs.setString(_prefsDailySelfieUser, _userId!);
+    notifyListeners();
+    // Still publish today's login activity when we have a selfie URL from earlier today.
+    final existing = todaysLoginSelfieUrl ?? _dailyFieldSelfieUrl;
+    if (existing != null && existing.isNotEmpty) {
+      await finalizeLoginSelfieForToday(selfieDataUrl: existing);
+    }
+  }
+
+  /// After backend accepts login selfie: mark once-per-day and publish to admin Logs.
+  /// Does not open the camera again — uses [localSelfiePath] or [selfieDataUrl] from login.
+  Future<void> finalizeLoginSelfieForToday({
+    String? localSelfiePath,
+    String? selfieDataUrl,
+  }) async {
+    if (!_isExecutiveRole() || _userId == null) return;
+
+    String remoteSelfie = '';
+    if (localSelfiePath != null && localSelfiePath.isNotEmpty) {
+      remoteSelfie = await _resolveSelfieUrl(localSelfiePath);
+    } else if (selfieDataUrl != null && selfieDataUrl.trim().isNotEmpty) {
+      remoteSelfie = await _resolveSelfieUrl(selfieDataUrl.trim());
+    } else if ((_dailyFieldSelfieUrl ?? '').isNotEmpty) {
+      remoteSelfie = await _resolveSelfieUrl(_dailyFieldSelfieUrl!);
+    }
+
+    final todayKey = _todayDateKey();
+
+    _dailyFieldSelfieDate = todayKey;
+    _dailyFieldSelfieUserId = _userId;
+    if (remoteSelfie.isNotEmpty) {
+      _dailyFieldSelfieUrl = remoteSelfie;
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_prefsDailySelfieDate, _dailyFieldSelfieDate!);
+    await prefs.setString(_prefsDailySelfieUser, _userId!);
+    if (remoteSelfie.isNotEmpty) {
+      await prefs.setString(_prefsDailySelfieUrl, remoteSelfie);
+    }
+    notifyListeners();
+
+    // Avoid duplicate daily-login visits on re-login the same day.
+    final publishedKey = 'daily_login_published_${todayKey}_$_userId';
+    if (prefs.getBool(publishedKey) == true) {
+      return;
+    }
+
+    final selfieForPublish = remoteSelfie.isNotEmpty ? remoteSelfie : 'auto-detected';
+
+    // Publish once to visits so admin Logs can show today's login selfie / activity.
+    try {
+      double lat = 0;
+      double lng = 0;
+      String? address;
+      final pos = await DeviceLocation.resolvePosition(timeLimit: const Duration(seconds: 8));
+      if (pos != null) {
+        lat = pos.latitude;
+        lng = pos.longitude;
+        try {
+          final places = await placemarkFromCoordinates(lat, lng);
+          if (places.isNotEmpty) {
+            final p = places.first;
+            address = [
+              p.name,
+              p.subLocality,
+              p.locality,
+              p.administrativeArea,
+            ].where((s) => (s ?? '').toString().trim().isNotEmpty).join(', ');
+          }
+        } catch (_) {}
+      }
+      await _publishDailyLoginActivity(
+        latitude: lat,
+        longitude: lng,
+        address: address,
+        selfieUrl: selfieForPublish,
+      );
+      await prefs.setBool(publishedKey, true);
+    } catch (e) {
+      print('finalizeLoginSelfieForToday publish skipped: $e');
+    }
+  }
+
+  /// @deprecated Use [finalizeLoginSelfieForToday] — local second selfie prompt removed.
+  Future<bool> completeDailyFieldSelfie(String localSelfiePath) async {
+    await finalizeLoginSelfieForToday(localSelfiePath: localSelfiePath);
+    return true;
+  }
+
+  /// Creates/reuses a system outlet and records start+end visit with daily selfie.
+  Future<void> _publishDailyLoginActivity({
+    required double latitude,
+    required double longitude,
+    String? address,
+    required String selfieUrl,
+  }) async {
+    try {
+      String? outletId;
+      try {
+        final outlets = await _api.production.outlets();
+        for (final o in outlets) {
+          final name = (o['name'] ?? '').toString().trim().toLowerCase();
+          if (name == dailyLoginOutletName.toLowerCase()) {
+            outletId = o['id']?.toString();
+            break;
+          }
+        }
+      } catch (_) {}
+
+      if (outletId == null || outletId.isEmpty) {
+        final created = await _api.production.createOutlet({
+          'name': dailyLoginOutletName,
+          'address': 'System · daily executive login & selfie',
+          'latitude': latitude,
+          'longitude': longitude,
+          'type': 'other',
+        });
+        outletId = created?['id']?.toString();
+      }
+      if (outletId == null || outletId.isEmpty) return;
+
+      final notes =
+          '$dailyLoginNotesPrefix|place=${address ?? 'Field start'}';
+      final visit = await _api.production.visitStart(
+        outletId: outletId,
+        latitude: latitude,
+        longitude: longitude,
+        notes: notes,
+        selfieUrl: selfieUrl,
+      );
+      final visitId = visit['id']?.toString();
+      if (visitId != null && visitId.isNotEmpty) {
+        await _api.production.visitEnd(
+          visitId: visitId,
+          latitude: latitude,
+          longitude: longitude,
+          outcome: 'completed',
+          notes: notes,
+        );
+      }
+    } catch (e) {
+      print('Publish daily login activity failed (local selfie still saved): $e');
+    }
   }
 
   void _startAttendanceClock(DateTime checkInAt, {bool persist = true}) {
@@ -780,11 +1639,24 @@ class AppProvider extends ChangeNotifier {
       'id': outlet['id'],
       'name': outlet['name'] ?? outlet['outlet_name'] ?? 'Outlet',
       'address': outlet['address'] ?? outlet['outlet_address'] ?? '',
+      'phone': outlet['phone'] ?? outlet['contactPhone'] ?? outlet['contact_phone'] ?? '',
+      'ownerName': outlet['owner_name'] ?? outlet['ownerName'] ?? '',
+      'ownerPhone': outlet['owner_phone'] ?? outlet['ownerPhone'] ?? '',
+      'nextVisitDate': outlet['next_visit_date'] ??
+          outlet['nextVisitDate'] ??
+          outlet['next_visit_at'] ??
+          outlet['scheduled_next_visit'],
+      'nextVisitNotes': outlet['next_visit_notes'] ??
+          outlet['nextVisitNotes'] ??
+          outlet['notes'] ??
+          '',
+      'partyStatus': outlet['party_status'] ?? outlet['partyStatus'] ?? 'active',
       'latitude': outlet['latitude'] ?? outlet['gps_lat'] ?? outlet['lat'],
       'longitude': outlet['longitude'] ?? outlet['gps_lng'] ?? outlet['lng'],
       'grade': outlet['grade'],
       'overallRating': outlet['overall_rating'] ?? outlet['overallRating'],
       'visitStatus': outlet['visit_status'] ?? outlet['visitStatus'] ?? 'PENDING',
+      'isManual': outlet['isManual'] == true,
     };
   }
 
@@ -793,7 +1665,7 @@ class AppProvider extends ChangeNotifier {
     try {
       final response = await _api.todayPlan(_userId!);
       if (response.statusCode == 200) {
-        return Map<String, dynamic>.from(response.data as Map);
+        return _responseData(response);
       }
     } catch (e) {
       print('Today plan pull failed: $e');
@@ -802,45 +1674,228 @@ class AppProvider extends ChangeNotifier {
   }
 
   Future<void> fetchTodayPlan() async {
+    // Keep the executive's selected day plan. Production todayPlan often returns
+    // every outlet with PENDING status, which wiped "Visit completed".
+    final hadLocalPlan = _todayPlan != null && _plannedOutlets.isNotEmpty;
+    if (!hadLocalPlan) {
+      await _restoreTodayPlanFromLocal();
+    }
+
     try {
       final data = await _pullSyncData();
-      if (data == null) return;
+      if (data != null && !hadLocalPlan && _todayPlan == null) {
+        final plan = data['plan'];
+        final outlets = (data['outlets'] as List<dynamic>? ?? [])
+            .whereType<Map>()
+            .map((o) => _normalizeOutlet(Map<String, dynamic>.from(o)))
+            .toList();
+        final progress = _mapFrom(data['progress']);
 
-      final plan = data['plan'];
-      final outlets = (data['outlets'] as List<dynamic>? ?? [])
-          .whereType<Map>()
-          .map((o) => _normalizeOutlet(Map<String, dynamic>.from(o)))
-          .toList();
-      final progress = _mapFrom(data['progress']);
-
-      if (plan is Map) {
-        _todayPlan = Map<String, dynamic>.from(plan);
-        _plannedOutlets = outlets;
-        _plannedVisitsCount = int.tryParse(progress['planned']?.toString() ?? '') ??
-            int.tryParse(_todayPlan!['plannedVisits']?.toString() ?? '') ??
-            outlets.length;
-        _completedVisitsCount = int.tryParse(progress['completed']?.toString() ?? '') ??
-            int.tryParse(_todayPlan!['completedVisits']?.toString() ?? '') ??
-            0;
-        _planProgressPercentage =
-            double.tryParse(progress['percentage']?.toString() ?? '') ??
-                (_plannedVisitsCount > 0
-                    ? (_completedVisitsCount / _plannedVisitsCount) * 100.0
-                    : 0.0);
-      } else {
-        _todayPlan = null;
-        _plannedOutlets = [];
-        _plannedVisitsCount = 0;
-        _completedVisitsCount = 0;
-        _planProgressPercentage = 0.0;
-      }
-      notifyListeners();
-      await restoreActiveVisitFromLocalDb();
-      if (_todayPlan != null) {
-        startAutoVisitMonitoring();
+        if (plan is Map && outlets.isNotEmpty) {
+          _todayPlan = Map<String, dynamic>.from(plan);
+          _plannedOutlets = outlets;
+          _dedupePlannedOutlets();
+          _plannedVisitsCount = int.tryParse(progress['planned']?.toString() ?? '') ??
+              int.tryParse(_todayPlan!['plannedVisits']?.toString() ?? '') ??
+              _plannedOutlets.length;
+        }
       }
     } catch (e) {
       print('fetchTodayPlan failed: $e');
+    }
+
+    await _applyVisitStatusesFromOfflineVisits();
+    await _mergeOutletNextVisitsFromServer();
+    _dedupePlannedOutlets();
+    await _recomputeTodayDistanceFromLocalGps();
+    await restoreActiveVisitFromLocalDb();
+    if (_todayPlan != null) {
+      startAutoVisitMonitoring();
+      await _persistTodayPlanLocally();
+    }
+    notifyListeners();
+  }
+
+  /// Pull next_visit_date + contact fields from GET /outlets so Home keeps showing
+  /// details the executive entered (server plan payloads often omit them).
+  Future<void> _mergeOutletNextVisitsFromServer() async {
+    if (_plannedOutlets.isEmpty) return;
+    try {
+      final remote = await _api.production.outlets();
+      if (remote.isEmpty) return;
+      final byId = <String, Map<String, dynamic>>{};
+      for (final o in remote) {
+        final id = o['id']?.toString();
+        if (id != null && id.isNotEmpty) byId[id] = o;
+      }
+      var changed = false;
+      for (var i = 0; i < _plannedOutlets.length; i++) {
+        final o = _plannedOutlets[i];
+        if (o is! Map) continue;
+        final id = o['id']?.toString();
+        if (id == null) continue;
+        final remoteO = byId[id];
+        if (remoteO == null) continue;
+        final copy = Map<String, dynamic>.from(o);
+        final next = remoteO['next_visit_date'] ??
+            remoteO['nextVisitDate'] ??
+            remoteO['next_visit_at'];
+        final notes = remoteO['next_visit_notes'] ??
+            remoteO['nextVisitNotes'] ??
+            remoteO['notes'];
+        final phone = remoteO['phone']?.toString();
+        final ownerName = (remoteO['owner_name'] ?? remoteO['ownerName'])?.toString();
+        final ownerPhone = (remoteO['owner_phone'] ?? remoteO['ownerPhone'])?.toString();
+        final address = remoteO['address']?.toString();
+        final name = remoteO['name']?.toString();
+
+        if (next != null && next.toString().isNotEmpty) {
+          if (copy['nextVisitDate']?.toString() != next.toString()) {
+            copy['nextVisitDate'] = next.toString();
+            changed = true;
+          }
+        }
+        if (notes != null && notes.toString().isNotEmpty) {
+          copy['nextVisitNotes'] = notes.toString();
+          changed = true;
+        }
+        // Prefer server values when present; never wipe local non-empty with empty.
+        if (name != null && name.isNotEmpty && copy['name']?.toString() != name) {
+          copy['name'] = name;
+          changed = true;
+        }
+        if (phone != null && phone.isNotEmpty) {
+          copy['phone'] = phone;
+          changed = true;
+        }
+        if (ownerName != null && ownerName.isNotEmpty) {
+          copy['ownerName'] = ownerName;
+          changed = true;
+        }
+        if (ownerPhone != null && ownerPhone.isNotEmpty) {
+          copy['ownerPhone'] = ownerPhone;
+          changed = true;
+        }
+        if (address != null && address.isNotEmpty) {
+          copy['address'] = address;
+          changed = true;
+        }
+        _plannedOutlets[i] = copy;
+      }
+      if (changed) await _persistTodayPlanLocally();
+    } catch (e) {
+      print('mergeOutletNextVisitsFromServer failed: $e');
+    }
+  }
+
+  Future<void> _applyVisitStatusesFromOfflineVisits() async {
+    if (_plannedOutlets.isEmpty) return;
+
+    final visits = await DatabaseHelper.instance.queryAll('offline_visits');
+    final completedIds = <String>{};
+    final inProgressIds = <String>{};
+    final remarksByOutlet = <String, String>{};
+
+    for (final visit in visits) {
+      final outletId = visit['outlet_id']?.toString();
+      if (outletId == null || outletId.isEmpty) continue;
+      final checkIn = visit['checkin_time']?.toString();
+      final checkOut = visit['checkout_time']?.toString();
+      final when = checkOut ?? checkIn;
+      if (!_isSameLocalDay(when, DateTime.now())) continue;
+      final remarks = (visit['remarks'] ?? '').toString().trim();
+      if (remarks.isNotEmpty) {
+        remarksByOutlet[outletId] = remarks;
+      }
+      if (checkOut != null && checkOut.isNotEmpty) {
+        completedIds.add(outletId);
+      } else {
+        inProgressIds.add(outletId);
+      }
+    }
+
+    for (var i = 0; i < _plannedOutlets.length; i++) {
+      final outlet = _plannedOutlets[i];
+      if (outlet is! Map) continue;
+      final id = outlet['id']?.toString();
+      if (id == null) continue;
+      final copy = Map<String, dynamic>.from(outlet);
+      if (completedIds.contains(id)) {
+        copy['visitStatus'] = 'COMPLETED';
+      } else if (inProgressIds.contains(id) || isVisitActiveForOutlet(id)) {
+        copy['visitStatus'] = 'IN_PROGRESS';
+      } else if ((copy['visitStatus']?.toString() ?? '') != 'COMPLETED') {
+        final current = copy['visitStatus']?.toString() ?? 'PENDING';
+        if (current != 'COMPLETED') copy['visitStatus'] = 'PENDING';
+      }
+      final savedRemarks = remarksByOutlet[id];
+      if (savedRemarks != null && savedRemarks.isNotEmpty) {
+        copy['visitRemarks'] = savedRemarks;
+        copy['remarks'] = savedRemarks;
+      }
+      _plannedOutlets[i] = copy;
+    }
+
+    _recomputePlanProgressFromOutlets();
+  }
+
+  void _recomputePlanProgressFromOutlets() {
+    _plannedVisitsCount = _plannedOutlets.length;
+    _completedVisitsCount = _plannedOutlets.where((o) => o is Map && o['visitStatus'] == 'COMPLETED').length;
+    _planProgressPercentage = _plannedVisitsCount > 0
+        ? (_completedVisitsCount / _plannedVisitsCount) * 100.0
+        : 0.0;
+    if (_todayPlan != null) {
+      _todayPlan!['planned_visits'] = _plannedVisitsCount;
+      _todayPlan!['completed_visits'] = _completedVisitsCount;
+      _todayPlan!['completedVisits'] = _completedVisitsCount;
+    }
+  }
+
+  bool _isSameLocalDay(String? iso, DateTime day) {
+    if (iso == null || iso.isEmpty) return false;
+    final parsed = DateTime.tryParse(iso);
+    if (parsed == null) return false;
+    final local = parsed.toLocal();
+    return local.year == day.year && local.month == day.month && local.day == day.day;
+  }
+
+  Future<void> _recomputeTodayDistanceFromLocalGps() async {
+    final pings = await DatabaseHelper.instance.queryAll('offline_gps_pings');
+    final todayPings = pings.where((p) => _isSameLocalDay(p['timestamp']?.toString(), DateTime.now())).toList();
+    double km = 0.0;
+    for (var i = 1; i < todayPings.length; i++) {
+      final prevLat = double.tryParse(todayPings[i - 1]['latitude']?.toString() ?? '');
+      final prevLng = double.tryParse(todayPings[i - 1]['longitude']?.toString() ?? '');
+      final currLat = double.tryParse(todayPings[i]['latitude']?.toString() ?? '');
+      final currLng = double.tryParse(todayPings[i]['longitude']?.toString() ?? '');
+      if (prevLat == null || prevLng == null || currLat == null || currLng == null) continue;
+      if (prevLat.abs() < 0.01 && prevLng.abs() < 0.01) continue;
+      if (currLat.abs() < 0.01 && currLng.abs() < 0.01) continue;
+      final delta = _calculateHaversineDistance(prevLat, prevLng, currLat, currLng);
+      if (delta >= 0.015) km += delta;
+    }
+    if (todayPings.isNotEmpty) {
+      _lastPingLat = double.tryParse(todayPings.last['latitude']?.toString() ?? '');
+      _lastPingLng = double.tryParse(todayPings.last['longitude']?.toString() ?? '');
+    }
+    // Never replace a higher live total with a lower recompute mid-session unless recompute is newer.
+    if (km >= _totalDistanceCoveredKm || _totalDistanceCoveredKm == 0) {
+      _totalDistanceCoveredKm = km;
+    }
+    await _persistTodayDistance();
+  }
+
+  Future<void> _persistTodayDistance() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble('today_distance_km_${_todayDateKey()}', _totalDistanceCoveredKm);
+  }
+
+  Future<void> _restoreTodayDistance() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getDouble('today_distance_km_${_todayDateKey()}');
+    if (saved != null && saved > _totalDistanceCoveredKm) {
+      _totalDistanceCoveredKm = saved;
     }
   }
 
@@ -851,7 +1906,7 @@ class AppProvider extends ChangeNotifier {
     try {
       final response = await _api.getRoutes();
       if (response.statusCode == 200) {
-        serverRoutes.addAll(response.data['routes'] as List<dynamic>? ?? []);
+        serverRoutes.addAll(_responseList(response, 'routes'));
       }
     } catch (e) {
       print('fetchAvailableRoutes failed: $e');
@@ -872,11 +1927,25 @@ class AppProvider extends ChangeNotifier {
     try {
       final response = await _api.getRouteOutlets(routeId);
       if (response.statusCode == 200) {
-        final raw = response.data['outlets'] as List<dynamic>? ?? [];
+        final payload = _responseData(response);
+        final raw = (payload['outlets'] as List<dynamic>?) ??
+            _responseList(response, 'outlets');
         _routeOutlets = raw
             .whereType<Map>()
             .map((o) => _normalizeOutlet(Map<String, dynamic>.from(o)))
+            .where((o) => !_isSystemDailyLoginOutlet(o))
             .toList();
+        // Collapse duplicate shops returned by the route payload.
+        final seenIds = <String>{};
+        final seenNames = <String>{};
+        _routeOutlets = _routeOutlets.where((o) {
+          if (o is! Map) return false;
+          final id = o['id']?.toString() ?? '';
+          final name = (o['name'] ?? '').toString().trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+          if (id.isNotEmpty && !seenIds.add(id)) return false;
+          if (name.isNotEmpty && !seenNames.add(name)) return false;
+          return true;
+        }).toList();
         notifyListeners();
       }
     } catch (e) {
@@ -904,6 +1973,7 @@ class AppProvider extends ChangeNotifier {
           await fetchRouteOutlets(routeId);
           if (_routeOutlets.isNotEmpty) {
             _plannedOutlets = List.from(_routeOutlets);
+            _dedupePlannedOutlets();
             _plannedVisitsCount = _plannedOutlets.length;
             _todayPlan ??= {
               'route_id': routeId,
@@ -943,6 +2013,7 @@ class AppProvider extends ChangeNotifier {
       'completed_visits': 0,
     };
     _plannedOutlets = outlets.map((o) => o is Map ? _normalizeOutlet(Map<String, dynamic>.from(o)) : o).toList();
+    _dedupePlannedOutlets();
     _routeOutlets = List.from(_plannedOutlets);
     _plannedVisitsCount = _plannedOutlets.length;
     _completedVisitsCount = 0;
@@ -979,17 +2050,25 @@ class AppProvider extends ChangeNotifier {
           ? restoredPlan
           : Map<String, dynamic>.from(restoredPlan as Map);
       _plannedOutlets = restoredOutlets;
-      _routeOutlets = List.from(restoredOutlets);
-      _plannedVisitsCount = restoredOutlets.length;
+      _dedupePlannedOutlets();
+      _routeOutlets = List.from(_plannedOutlets);
+      _plannedVisitsCount = _plannedOutlets.length;
+      await _persistTodayPlanLocally();
 
       final localCompleted = await DatabaseHelper.instance.queryAll(
         'offline_visits',
         where: 'checkout_time IS NOT NULL',
       );
-      _completedVisitsCount = localCompleted.length;
-      _planProgressPercentage = _plannedVisitsCount > 0
-          ? (_completedVisitsCount / _plannedVisitsCount) * 100.0
-          : 0.0;
+      // Prefer status flags stored on outlets; fall back to today's checkouts.
+      await _applyVisitStatusesFromOfflineVisits();
+      if (_completedVisitsCount == 0) {
+        _completedVisitsCount = localCompleted
+            .where((v) => _isSameLocalDay(v['checkout_time']?.toString(), DateTime.now()))
+            .length;
+        _planProgressPercentage = _plannedVisitsCount > 0
+            ? (_completedVisitsCount / _plannedVisitsCount) * 100.0
+            : 0.0;
+      }
 
       await restoreActiveVisitFromLocalDb();
       startAutoVisitMonitoring();
@@ -1028,31 +2107,172 @@ class AppProvider extends ChangeNotifier {
     String address, {
     required double latitude,
     required double longitude,
+    String? phone,
+    String? ownerName,
+    String? ownerPhone,
   }) async {
-    if (_todayPlan == null) return false;
+    if (_todayPlan == null) {
+      _todayPlan = {
+        'id': 'local-plan-${_uuid.v4()}',
+        'route_id': 'manual',
+        'planned_visits': 0,
+      };
+    }
+
+    final outletPhone = (phone ?? '').trim();
+    final concernName = (ownerName ?? '').trim();
+    final concernPhone = (ownerPhone ?? '').trim();
+
+    String outletId = _uuid.v4();
+    try {
+      final created = await _api.production.createOutlet({
+        'name': name.trim(),
+        'address': address.trim(),
+        if (outletPhone.isNotEmpty) 'phone': outletPhone,
+        if (concernName.isNotEmpty) 'owner_name': concernName,
+        if (concernPhone.isNotEmpty) 'owner_phone': concernPhone,
+        'latitude': latitude,
+        'longitude': longitude,
+        'type': 'retailer',
+        'source': 'manual',
+      });
+      if (created != null && created['id'] != null) {
+        outletId = created['id'].toString();
+      }
+    } catch (e) {
+      print('Manual outlet create on server failed, keeping local id: $e');
+    }
 
     final outlet = {
-      'id': 'outlet-${_uuid.v4()}',
-      'name': name,
-      'address': address,
+      'id': outletId,
+      'name': name.trim(),
+      'address': address.trim(),
+      'phone': outletPhone,
+      'ownerName': concernName,
+      'ownerPhone': concernPhone,
       'latitude': latitude,
       'longitude': longitude,
       'grade': 'Unrated',
       'overallRating': null,
       'visitStatus': 'PENDING',
       'isManual': true,
+      'partyStatus': 'active',
     };
 
-    _routeOutlets.add(outlet);
-    _plannedOutlets.add(outlet);
+    _routeOutlets.insert(0, outlet);
+    // Newest manual outlet at the top of Planned.
+    _plannedOutlets = [outlet, ..._plannedOutlets];
+    _dedupePlannedOutlets();
     _plannedVisitsCount = _plannedOutlets.length;
     _todayPlan!['planned_visits'] = _plannedVisitsCount;
     final activeRouteId = _todayPlan!['route_id']?.toString();
-    if (activeRouteId != null) {
+    if (activeRouteId != null && activeRouteId != 'manual') {
       await _appendOutletToSavedRoute(activeRouteId, outlet);
     }
     if (_plannedVisitsCount > 0) {
       _planProgressPercentage = (_completedVisitsCount / _plannedVisitsCount) * 100.0;
+    }
+    await _persistTodayPlanLocally();
+    notifyListeners();
+    return true;
+  }
+
+  /// Soft-delete outlet on server and remove from today's planned list.
+  Future<bool> deletePlannedOutlet(String outletId) async {
+    _lastActionError = null;
+    if (outletId.isEmpty) {
+      _lastActionError = 'Outlet id missing.';
+      return false;
+    }
+    try {
+      final ok = await _api.production.deleteOutlet(outletId);
+      if (!ok) {
+        // Still remove from local plan if server soft-delete failed for local-only ids.
+        print('DELETE outlet returned non-success; removing from local plan anyway.');
+      }
+    } catch (e) {
+      print('DELETE outlet failed: $e');
+      _lastActionError = 'Could not delete outlet on server.';
+    }
+
+    _plannedOutlets = _plannedOutlets
+        .where((o) => o is! Map || o['id']?.toString() != outletId)
+        .toList();
+    _routeOutlets = _routeOutlets
+        .where((o) => o is! Map || o['id']?.toString() != outletId)
+        .toList();
+    _plannedVisitsCount = _plannedOutlets.length;
+    _completedVisitsCount =
+        _plannedOutlets.where((o) => o is Map && o['visitStatus'] == 'COMPLETED').length;
+    if (_todayPlan != null) {
+      _todayPlan!['planned_visits'] = _plannedVisitsCount;
+    }
+    if (_plannedVisitsCount > 0) {
+      _planProgressPercentage = (_completedVisitsCount / _plannedVisitsCount) * 100.0;
+    } else {
+      _planProgressPercentage = 0;
+    }
+    await _persistTodayPlanLocally();
+    notifyListeners();
+    return true;
+  }
+
+  /// Schedule next visit date/time (+ optional notes) via PATCH /outlets/:id.
+  Future<bool> scheduleOutletNextVisit({
+    required String outletId,
+    required DateTime when,
+    String? notes,
+  }) async {
+    _lastActionError = null;
+    if (outletId.isEmpty) {
+      _lastActionError = 'Outlet id missing.';
+      return false;
+    }
+    final note = (notes ?? '').trim();
+    final whenIso = when.toUtc().toIso8601String();
+    try {
+      final updated = await _api.production.updateOutlet(outletId, {
+        'next_visit_date': whenIso,
+        if (note.isNotEmpty) 'next_visit_notes': note,
+        if (note.isNotEmpty) 'notes': note,
+      });
+      if (updated == null) {
+        _lastActionError = 'Could not save next visit on server.';
+        // Keep local schedule so executive still sees it.
+      } else {
+        final serverNext = updated['next_visit_date'] ?? updated['nextVisitDate'];
+        if (serverNext != null && serverNext.toString().isNotEmpty) {
+          // Prefer server-confirmed value when present.
+        }
+      }
+    } catch (e) {
+      print('scheduleOutletNextVisit failed: $e');
+      _lastActionError = e.toString();
+    }
+
+    for (var i = 0; i < _plannedOutlets.length; i++) {
+      final o = _plannedOutlets[i];
+      if (o is Map && o['id']?.toString() == outletId) {
+        final copy = Map<String, dynamic>.from(o);
+        copy['nextVisitDate'] = whenIso;
+        copy['nextVisitNotes'] = note;
+        final existingRemarks = (copy['visitRemarks'] ?? copy['remarks'] ?? '').toString();
+        final parts = existingRemarks
+            .split(';')
+            .map((e) => e.trim())
+            .where((e) => e.isNotEmpty)
+            .toList();
+        if (!parts.any((p) => p.toLowerCase() == 'next visit')) {
+          parts.insert(0, 'Next Visit');
+        }
+        if (note.isNotEmpty && !parts.contains(note)) {
+          parts.add(note);
+        }
+        copy['visitRemarks'] = parts.join('; ');
+        copy['remarks'] = copy['visitRemarks'];
+        _plannedOutlets[i] = copy;
+        break;
+      }
     }
     await _persistTodayPlanLocally();
     notifyListeners();
@@ -1240,12 +2460,8 @@ class AppProvider extends ChangeNotifier {
         return;
       }
 
-      final position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-          timeLimit: Duration(seconds: 10),
-        ),
-      );
+      final position = await DeviceLocation.resolvePosition(timeLimit: const Duration(seconds: 10));
+      if (position == null) return;
       await processAutoVisitLocation(position.latitude, position.longitude);
     } catch (_) {
       // Keep monitoring alive even if one GPS read fails.
@@ -1293,7 +2509,13 @@ class AppProvider extends ChangeNotifier {
 
     final dwellSeconds = DateTime.now().difference(_dwellStartedAt!).inSeconds;
     if (dwellSeconds >= _minimumVisitDurationMinutes * 60) {
-      await autoRegisterVisit(outletId, lat, lng, address, matchedOutlet);
+      // When selfie is required, auto-dwell only starts a visit if policy allows;
+      // default policy (selfie OFF) auto-completes the outlet visit.
+      if (_selfieRequired) {
+        await autoRegisterVisit(outletId, lat, lng, address, matchedOutlet);
+      } else {
+        await autoCompleteVisit(outletId, lat, lng, address, matchedOutlet);
+      }
       _dwellOutletId = null;
       _dwellStartedAt = null;
     }
@@ -1358,6 +2580,86 @@ class AppProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Auto-complete outlet after dwell (selfie policy OFF): check-in + check-out = COMPLETED.
+  Future<void> autoCompleteVisit(
+    String outletId,
+    double lat,
+    double lng,
+    String? address,
+    Map<String, dynamic> outlet,
+  ) async {
+    if (_activeVisit != null) return;
+
+    if (_attendanceStatus != 'LOGGED_IN') {
+      _startAttendanceClock(DateTime.now().toUtc());
+    }
+
+    final localId = _uuid.v4();
+    final resolvedAddress = address ?? '';
+    final nowIso = DateTime.now().toUtc().toIso8601String();
+    final remarks = 'Auto-completed after $_minimumVisitDurationMinutes min stay (selfie not required).';
+
+    String visitId = localId;
+    var synced = 0;
+
+    try {
+      final response = await _apiClient.post(ApiEndpoints.visitsCheckIn, data: {
+        if (RegExp(r'^[0-9a-fA-F-]{36}$').hasMatch(outletId)) 'outletId': outletId,
+        'outlet': {
+          'name': outlet['name'],
+          'address': outlet['address'] ?? resolvedAddress,
+          'gpsLat': double.tryParse(outlet['latitude']?.toString() ?? '') ?? lat,
+          'gpsLng': double.tryParse(outlet['longitude']?.toString() ?? '') ?? lng,
+        },
+        'gpsLat': lat,
+        'gpsLng': lng,
+        'selfieUrl': 'auto-detected',
+        'managerOverrideFlag': false,
+        'autoComplete': true,
+      });
+      if (response.statusCode == 201) {
+        final visit = _mapFrom(response.data['visit']);
+        visitId = visit['id']?.toString() ?? visitId;
+        synced = 1;
+      }
+    } catch (e) {
+      print('Auto-complete visit API failed, storing locally: $e');
+    }
+
+    await DatabaseHelper.instance.insert('offline_visits', {
+      'id': visitId,
+      'outlet_id': outletId,
+      'gps_lat': lat,
+      'gps_lng': lng,
+      'address': resolvedAddress,
+      'selfie_url': 'auto-detected',
+      'checkin_time': nowIso,
+      'checkout_time': nowIso,
+      'manager_override': 0,
+      'auto_detected': 1,
+      'remarks': remarks,
+      'synced': synced,
+    });
+    await recordGpsPing(lat, lng, _odometerStartPoint, address: resolvedAddress);
+
+    _markOutletVisitStatus(outletId, 'COMPLETED');
+    _completedVisitsCount = _plannedOutlets.where((o) => o is Map && o['visitStatus'] == 'COMPLETED').length;
+    if (_plannedVisitsCount > 0) {
+      _planProgressPercentage = (_completedVisitsCount / _plannedVisitsCount) * 100.0;
+    }
+    if (_todayPlan != null) {
+      _todayPlan!['completed_visits'] = _completedVisitsCount;
+      _todayPlan!['completedVisits'] = _completedVisitsCount;
+    }
+
+    _lastAutoRegisteredOutlet = {
+      'id': outletId,
+      'name': outlet['name'] ?? 'Outlet',
+      'completed': true,
+    };
+    notifyListeners();
+  }
+
   Map<String, dynamic>? _findOutletById(String outletId) {
     for (final outlet in _plannedOutlets) {
       if (outlet is Map && outlet['id']?.toString() == outletId) {
@@ -1374,16 +2676,12 @@ class AppProvider extends ChangeNotifier {
 
   void startContinuousGpsTracking() {
     if (_gpsTrackingTimer != null) return;
-    _gpsTrackingTimer = Timer.periodic(const Duration(seconds: 45), (_) async {
+    _gpsTrackingTimer = Timer.periodic(const Duration(seconds: 30), (_) async {
       if (_attendanceStatus != 'LOGGED_IN' && _attendanceStatus != 'PRESENT') return;
       if (_activeBreak != null) return;
       try {
-        final position = await Geolocator.getCurrentPosition(
-          locationSettings: const LocationSettings(
-            accuracy: LocationAccuracy.high,
-            timeLimit: Duration(seconds: 12),
-          ),
-        );
+        final position = await DeviceLocation.resolvePosition(timeLimit: const Duration(seconds: 12));
+        if (position == null) return;
         await recordGpsPing(position.latitude, position.longitude, _odometerStartPoint);
       } catch (e) {
         print('Continuous GPS ping failed: $e');
@@ -1396,16 +2694,89 @@ class AppProvider extends ChangeNotifier {
     _gpsTrackingTimer = null;
   }
 
+  DateTime? _lastGeocodeAt;
+  double? _lastGeocodeLat;
+  double? _lastGeocodeLng;
+  String? _lastGeocodeAddress;
+
+  Future<String?> resolveAddressFromCoordinates(double latitude, double longitude) async {
+    try {
+      final places = await placemarkFromCoordinates(latitude, longitude);
+      if (places.isEmpty) return null;
+      final p = places.first;
+      final parts = <String>[
+        if ((p.name ?? '').trim().isNotEmpty) p.name!.trim(),
+        if ((p.street ?? '').trim().isNotEmpty && p.street != p.name) p.street!.trim(),
+        if ((p.subLocality ?? '').trim().isNotEmpty) p.subLocality!.trim(),
+        if ((p.locality ?? '').trim().isNotEmpty) p.locality!.trim(),
+        if ((p.administrativeArea ?? '').trim().isNotEmpty) p.administrativeArea!.trim(),
+        if ((p.postalCode ?? '').trim().isNotEmpty) p.postalCode!.trim(),
+        if ((p.country ?? '').trim().isNotEmpty) p.country!.trim(),
+      ];
+      // Prefer plus-code / street line when name alone is a plus code with empty locality.
+      final joined = parts.where((s) => s.isNotEmpty).toSet().join(', ');
+      return joined.isNotEmpty ? joined : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  bool _isUnresolvedAddress(String? address) {
+    if (address == null) return true;
+    final a = address.trim().toLowerCase();
+    if (a.isEmpty) return true;
+    const placeholders = {
+      'location name not resolved',
+      'address not resolved',
+      'tracked location',
+      'gps ping',
+      'location',
+      'session resume',
+      'visit check-in',
+      'visit check-out',
+      'login location',
+    };
+    return placeholders.contains(a);
+  }
+
+  Future<String?> _resolveAddressCached(double latitude, double longitude, {bool force = false}) async {
+    if (!force &&
+        _lastGeocodeAddress != null &&
+        _lastGeocodeLat != null &&
+        _lastGeocodeLng != null &&
+        _lastGeocodeAt != null) {
+      final age = DateTime.now().difference(_lastGeocodeAt!);
+      final movedKm = Geo.distanceKm(_lastGeocodeLat!, _lastGeocodeLng!, latitude, longitude);
+      if (age < const Duration(minutes: 2) && movedKm < 0.2) {
+        return _lastGeocodeAddress;
+      }
+    }
+    final resolved = await resolveAddressFromCoordinates(latitude, longitude);
+    if (resolved != null) {
+      _lastGeocodeAddress = resolved;
+      _lastGeocodeLat = latitude;
+      _lastGeocodeLng = longitude;
+      _lastGeocodeAt = DateTime.now();
+    }
+    return resolved;
+  }
+
   Future<void> recordGpsPing(double latitude, double longitude, String trackingStartPoint, {String? address}) async {
     final timestamp = DateTime.now().toUtc().toIso8601String();
     final localPingId = _uuid.v4();
     final startPoint = trackingStartPoint == 'FIRST_OUTLET' ? 'FIRST_OUTLET' : 'HOME';
+
+    var resolvedAddress = address;
+    if (_isUnresolvedAddress(resolvedAddress)) {
+      resolvedAddress = await _resolveAddressCached(latitude, longitude);
+    }
 
     if (_lastPingLat != null && _lastPingLng != null) {
       final deltaKm = Geo.distanceKm(_lastPingLat!, _lastPingLng!, latitude, longitude);
       // Ignore GPS jitter under ~15 metres
       if (deltaKm >= 0.015) {
         _totalDistanceCoveredKm += deltaKm;
+        await _persistTodayDistance();
       }
     }
     _lastPingLat = latitude;
@@ -1415,7 +2786,7 @@ class AppProvider extends ChangeNotifier {
       'id': localPingId,
       'latitude': latitude,
       'longitude': longitude,
-      'address': address,
+      'address': resolvedAddress,
       'timestamp': timestamp,
       'tracking_start_point': startPoint,
       'synced': 0,
@@ -1434,6 +2805,7 @@ class AppProvider extends ChangeNotifier {
         longitude: longitude,
         trackingStartPoint: startPoint,
         timestamp: timestamp,
+        address: resolvedAddress,
       );
       if (response.statusCode == 201 || response.statusCode == 200) {
         await DatabaseHelper.instance.update(
@@ -1457,12 +2829,17 @@ class AppProvider extends ChangeNotifier {
   Future<void> refreshGpsSummaryFromServer() async {
     if (_userId == null) return;
     try {
-      final date = _todayDateKey();
-      final response = await _api.gpsSummary(_userId!, date);
+      final response = await _api.gpsSummary(_userId!, _todayDateKey());
       if (response.statusCode == 200) {
-        final km = double.tryParse(response.data['totalDistanceKm']?.toString() ?? '');
-        if (km != null) {
+        final payload = _responseData(response);
+        final km = double.tryParse(
+              (payload['totalDistanceKm'] ?? response.data['totalDistanceKm'])?.toString() ?? '',
+            ) ??
+            0.0;
+        // Production stub returns 0 — never wipe a real local odometer with that.
+        if (km > _totalDistanceCoveredKm) {
           _totalDistanceCoveredKm = km;
+          await _persistTodayDistance();
           notifyListeners();
         }
       }
@@ -1470,47 +2847,502 @@ class AppProvider extends ChangeNotifier {
   }
 
   // 5. Outlet Visit Workflow
+  static const List<Map<String, dynamic>> _fallbackProductCatalog = [
+    {
+      'id': 'fallback-ply-18',
+      'sku': 'PLY-18MM',
+      'name': 'Premium Plywood 18mm',
+      'size': '18mm',
+      'unitPrice': 1500.0,
+      'isCustom': false,
+      'isFallback': true,
+    },
+    {
+      'id': 'fallback-ply-12',
+      'sku': 'PLY-12MM',
+      'name': 'Premium Plywood 12mm',
+      'size': '12mm',
+      'unitPrice': 1200.0,
+      'isCustom': false,
+      'isFallback': true,
+    },
+  ];
+
+  static const _hiddenProductsPrefsKey = 'hidden_product_ids';
+
+  Future<Set<String>> _loadHiddenProductIds() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getStringList(_hiddenProductsPrefsKey) ?? const <String>[];
+      return raw.toSet();
+    } catch (_) {
+      return {};
+    }
+  }
+
+  Future<void> _persistHiddenProductIds(Set<String> ids) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(_hiddenProductsPrefsKey, ids.toList());
+  }
+
+  Future<List<Map<String, dynamic>>> _loadExecutiveCustomProducts() async {
+    try {
+      final rows = await DatabaseHelper.instance.queryAll('offline_executive_products');
+      return rows.map((row) {
+        return {
+          'id': row['id'],
+          'sku': row['sku'] ?? 'CUSTOM',
+          'name': row['name'] ?? 'Product',
+          'size': row['size'] ?? '',
+          'unitPrice': double.tryParse(row['unit_price']?.toString() ?? '') ?? 0.0,
+          'isCustom': true,
+          'isFallback': false,
+        };
+      }).toList();
+    } catch (e) {
+      print('Load executive products failed: $e');
+      return [];
+    }
+  }
+
   Future<void> fetchProductCatalog() async {
+    List<Map<String, dynamic>> apiProducts = [];
     try {
       final response = await _api.products();
       if (response.statusCode == 200) {
-        final rawProducts = (response.data['products'] as List<dynamic>?) ??
-            (response.data['data'] as List<dynamic>?) ??
-            [];
-        _productCatalog = rawProducts.map((p) {
-          double unitPrice = double.tryParse(
-                (p['unitPrice'] ?? p['unit_price'] ?? p['mrp'] ?? p['ptr'] ?? 0).toString(),
+        final rawProducts = _responseList(response, 'products');
+        apiProducts = rawProducts.map((p) {
+          final map = p is Map ? Map<String, dynamic>.from(p) : <String, dynamic>{};
+          final unitPrice = double.tryParse(
+                (map['unitPrice'] ?? map['unit_price'] ?? map['price'] ?? map['mrp'] ?? map['ptr'] ?? 0).toString(),
               ) ??
               0.0;
           return {
-            'id': p['id'],
-            'sku': p['sku'] ?? 'SKU-GEN',
-            'name': p['name'] ?? 'Product',
+            'id': map['id'],
+            'sku': map['sku'] ?? 'SKU-GEN',
+            'name': map['name'] ?? 'Product',
+            'size': map['size'] ?? map['pack_size'] ?? map['uom'] ?? '',
             'unitPrice': unitPrice,
+            'mrp': map['mrp'],
+            'ptr': map['ptr'],
+            'category_id': map['category_id'],
+            'brand_id': map['brand_id'],
+            'isCustom': false,
+            'isFallback': false,
+            'raw': map,
           };
         }).toList();
-        notifyListeners();
       }
     } catch (e) {
       print('Fetch product catalog failed: $e');
-      _productCatalog = [];
+    }
+
+    final hidden = await _loadHiddenProductIds();
+    final custom = await _loadExecutiveCustomProducts();
+    final byId = <String, Map<String, dynamic>>{};
+    for (final p in apiProducts) {
+      final id = p['id']?.toString();
+      if (id != null && id.isNotEmpty && !hidden.contains(id)) byId[id] = p;
+    }
+    for (final p in custom) {
+      final id = p['id']?.toString() ?? p['sku']?.toString();
+      if (id != null && id.isNotEmpty && !hidden.contains(id)) byId[id] = p;
+    }
+
+    for (final p in _fallbackProductCatalog) {
+      final id = p['id'].toString();
+      if (hidden.contains(id)) continue;
+      // Local edit (custom row with same id) already in byId wins.
+      byId.putIfAbsent(id, () => Map<String, dynamic>.from(p));
+    }
+
+    _productCatalog = byId.values.toList();
+    notifyListeners();
+  }
+
+  Future<bool> upsertExecutiveProduct({
+    String? id,
+    String? existingSku,
+    required String name,
+    required String size,
+    required double unitPrice,
+  }) async {
+    _lastActionError = null;
+    final trimmedName = name.trim();
+    if (trimmedName.isEmpty) {
+      _lastActionError = 'Product name is required.';
+      return false;
+    }
+    if (unitPrice < 0) {
+      _lastActionError = 'Price cannot be negative.';
+      return false;
+    }
+
+    final isEdit = id != null && id.isNotEmpty;
+    final productId = isEdit ? id! : _uuid.v4();
+    String sku = (existingSku != null && existingSku.trim().isNotEmpty)
+        ? existingSku.trim()
+        : 'EXE-${productId.replaceAll('-', '').substring(0, 8).toUpperCase()}';
+    final now = DateTime.now().toUtc().toIso8601String();
+    String createdAt = now;
+
+    if (isEdit) {
+      try {
+        final rows = await DatabaseHelper.instance.queryAll(
+          'offline_executive_products',
+          where: 'id = ?',
+          whereArgs: [productId],
+        );
+        if (rows.isNotEmpty) {
+          sku = rows.first['sku']?.toString() ?? sku;
+          createdAt = rows.first['created_at']?.toString() ?? now;
+        }
+      } catch (_) {}
+    }
+
+    // Editing a hardcoded/API product: keep it visible after save.
+    if (isEdit) {
+      final hidden = await _loadHiddenProductIds();
+      if (hidden.remove(productId)) {
+        await _persistHiddenProductIds(hidden);
+      }
+    }
+
+    try {
+      await DatabaseHelper.instance.insert('offline_executive_products', {
+        'id': productId,
+        'name': trimmedName,
+        'size': size.trim(),
+        'sku': sku,
+        'unit_price': unitPrice,
+        'created_at': createdAt,
+        'updated_at': now,
+      });
+    } catch (e) {
+      _lastActionError = 'Could not save product locally.';
+      print('upsertExecutiveProduct failed: $e');
+      return false;
+    }
+
+    if (!isEdit) {
+      try {
+        await _api.production.createProduct({
+          'name': trimmedName,
+          'sku': sku,
+          'mrp': unitPrice,
+          'ptr': unitPrice,
+          if (size.trim().isNotEmpty) 'pack_size': size.trim(),
+        });
+      } catch (_) {}
+    }
+
+    await fetchProductCatalog();
+    return true;
+  }
+
+  Future<bool> deleteExecutiveProduct(String productId) async {
+    _lastActionError = null;
+    try {
+      // Hide from catalog (hardcoded + API + custom) so it does not reappear.
+      final hidden = await _loadHiddenProductIds();
+      hidden.add(productId);
+      await _persistHiddenProductIds(hidden);
+
+      try {
+        await DatabaseHelper.instance.delete(
+          'offline_executive_products',
+          where: 'id = ?',
+          whereArgs: [productId],
+        );
+      } catch (_) {}
+
+      await fetchProductCatalog();
+      return true;
+    } catch (e) {
+      _lastActionError = 'Could not delete product.';
+      return false;
+    }
+  }
+
+  List<Map<String, dynamic>> _productCategories = [];
+  List<Map<String, dynamic>> _productBrands = [];
+  List<Map<String, dynamic>> get productCategoriesAdmin => _productCategories;
+  List<Map<String, dynamic>> get productBrandsAdmin => _productBrands;
+
+  Future<void> fetchProductAdminLists() async {
+    try {
+      _productCategories = await _api.production.productCategories();
+      _productBrands = await _api.production.productBrands();
+      await fetchProductCatalog();
+      notifyListeners();
+    } catch (e) {
+      print('Fetch product admin lists failed: $e');
       notifyListeners();
     }
   }
 
-  Future<String> _resolveSelfieUrl(String localPathOrUrl) async {
-    if (localPathOrUrl.startsWith('http://') || localPathOrUrl.startsWith('https://')) {
-      return localPathOrUrl;
-    }
-    final file = File(localPathOrUrl);
-    if (!await file.exists()) return localPathOrUrl;
+  Future<bool> createProductAdmin({
+    required String name,
+    required String sku,
+    required double mrp,
+    required double ptr,
+    String? categoryId,
+    String? brandId,
+  }) async {
+    _lastActionError = null;
     try {
-      return await _api.uploadSelfie(file);
+      await _api.production.createProduct({
+        'name': name.trim(),
+        'sku': sku.trim(),
+        'mrp': mrp,
+        'ptr': ptr,
+        if (categoryId != null && categoryId.isNotEmpty) 'category_id': categoryId,
+        if (brandId != null && brandId.isNotEmpty) 'brand_id': brandId,
+      });
+      await fetchProductAdminLists();
+      return true;
+    } on DioException catch (e) {
+      _lastActionError = ApiClient.errorMessage(e) ?? 'Could not create product.';
+      return false;
     } catch (e) {
-      print('Selfie upload failed, using local path placeholder: $e');
-      // Backend requires a non-empty URL; keep local path for offline queue.
-      return localPathOrUrl;
+      _lastActionError = e.toString();
+      return false;
     }
+  }
+
+  Future<bool> updateProductAdmin(String id, Map<String, dynamic> fields) async {
+    _lastActionError = null;
+    try {
+      await _api.production.updateProduct(id, fields);
+      await fetchProductAdminLists();
+      return true;
+    } on DioException catch (e) {
+      _lastActionError = ApiClient.errorMessage(e) ?? 'Could not update product.';
+      return false;
+    } catch (e) {
+      _lastActionError = e.toString();
+      return false;
+    }
+  }
+
+  Future<bool> deleteProductAdmin(String id) async {
+    _lastActionError = null;
+    try {
+      final ok = await _api.production.deleteProduct(id);
+      if (!ok) {
+        _lastActionError = 'Delete product failed.';
+        return false;
+      }
+      await fetchProductAdminLists();
+      return true;
+    } on DioException catch (e) {
+      _lastActionError = ApiClient.errorMessage(e) ?? 'Could not delete product.';
+      return false;
+    } catch (e) {
+      _lastActionError = e.toString();
+      return false;
+    }
+  }
+
+  Future<bool> createProductCategoryAdmin(String name) async {
+    _lastActionError = null;
+    try {
+      await _api.production.createProductCategory({'name': name.trim()});
+      await fetchProductAdminLists();
+      return true;
+    } on DioException catch (e) {
+      _lastActionError = ApiClient.errorMessage(e) ?? 'Could not create category.';
+      return false;
+    } catch (e) {
+      _lastActionError = e.toString();
+      return false;
+    }
+  }
+
+  Future<bool> updateProductCategoryAdmin(String id, String name) async {
+    _lastActionError = null;
+    try {
+      await _api.production.updateProductCategory(id, {'name': name.trim()});
+      await fetchProductAdminLists();
+      return true;
+    } on DioException catch (e) {
+      _lastActionError = ApiClient.errorMessage(e) ?? 'Could not update category.';
+      return false;
+    } catch (e) {
+      _lastActionError = e.toString();
+      return false;
+    }
+  }
+
+  Future<bool> deleteProductCategoryAdmin(String id) async {
+    _lastActionError = null;
+    try {
+      final ok = await _api.production.deleteProductCategory(id);
+      if (!ok) {
+        _lastActionError = 'Delete category failed.';
+        return false;
+      }
+      await fetchProductAdminLists();
+      return true;
+    } on DioException catch (e) {
+      _lastActionError = ApiClient.errorMessage(e) ?? 'Could not delete category.';
+      return false;
+    } catch (e) {
+      _lastActionError = e.toString();
+      return false;
+    }
+  }
+
+  Future<bool> createProductBrandAdmin(String name) async {
+    _lastActionError = null;
+    try {
+      await _api.production.createProductBrand({'name': name.trim()});
+      await fetchProductAdminLists();
+      return true;
+    } on DioException catch (e) {
+      _lastActionError = ApiClient.errorMessage(e) ?? 'Could not create brand.';
+      return false;
+    } catch (e) {
+      _lastActionError = e.toString();
+      return false;
+    }
+  }
+
+  Future<bool> updateProductBrandAdmin(String id, String name) async {
+    _lastActionError = null;
+    try {
+      await _api.production.updateProductBrand(id, {'name': name.trim()});
+      await fetchProductAdminLists();
+      return true;
+    } on DioException catch (e) {
+      _lastActionError = ApiClient.errorMessage(e) ?? 'Could not update brand.';
+      return false;
+    } catch (e) {
+      _lastActionError = e.toString();
+      return false;
+    }
+  }
+
+  Future<bool> deleteProductBrandAdmin(String id) async {
+    _lastActionError = null;
+    try {
+      final ok = await _api.production.deleteProductBrand(id);
+      if (!ok) {
+        _lastActionError = 'Delete brand failed.';
+        return false;
+      }
+      await fetchProductAdminLists();
+      return true;
+    } on DioException catch (e) {
+      _lastActionError = ApiClient.errorMessage(e) ?? 'Could not delete brand.';
+      return false;
+    } catch (e) {
+      _lastActionError = e.toString();
+      return false;
+    }
+  }
+
+  Future<String> _resolveSelfieUrl(String localPathOrUrl) async {
+    final raw = localPathOrUrl.trim();
+    if (raw.isEmpty) return raw;
+
+    // Prefer a short HTTP(S) URL — data URIs are too large for visit.selfie_url columns.
+    if (raw.startsWith('http://') || raw.startsWith('https://')) {
+      return raw;
+    }
+
+    File? file;
+    var deleteTemp = false;
+    if (raw.startsWith('data:image')) {
+      try {
+        final b64 = raw.contains(',') ? raw.split(',').last : raw;
+        final bytes = base64Decode(b64);
+        final dir = await Directory.systemTemp.createTemp('me_selfie_');
+        file = File('${dir.path}/selfie.jpg');
+        await file.writeAsBytes(bytes, flush: true);
+        deleteTemp = true;
+      } catch (_) {
+        return raw.length > 480 ? 'auto-detected' : raw;
+      }
+    } else {
+      file = File(raw);
+      if (!await file.exists()) {
+        // Maybe a relative server path.
+        if (raw.startsWith('/')) return '${ApiEndpoints.baseUrl}$raw';
+        return raw;
+      }
+    }
+
+    try {
+      final uploaded = await _api.uploadSelfie(file!);
+      if (uploaded.trim().isNotEmpty) {
+        final url = uploaded.trim();
+        if (url.startsWith('http')) return url;
+        if (url.startsWith('/')) return '${ApiEndpoints.baseUrl}$url';
+        return '${ApiEndpoints.baseUrl}/$url';
+      }
+    } catch (e) {
+      print('Selfie upload failed, embedding data URI fallback: $e');
+    }
+
+    // Upload unavailable — keep a renderable data URI when we still have bytes.
+    try {
+      if (await file!.exists()) {
+        final bytes = await file.readAsBytes();
+        if (bytes.isNotEmpty) {
+          final embedded = 'data:image/jpeg;base64,${base64Encode(bytes)}';
+          if (deleteTemp) {
+            try {
+              await file.parent.delete(recursive: true);
+            } catch (_) {}
+          }
+          return embedded;
+        }
+      }
+    } catch (_) {}
+
+    if (deleteTemp) {
+      try {
+        await file!.parent.delete(recursive: true);
+      } catch (_) {}
+    }
+    return raw.startsWith('data:image') ? raw : 'auto-detected';
+  }
+
+  /// Normalize any selfie field from API / notes into a renderable absolute URL.
+  String? _absoluteSelfieUrl(String? raw) {
+    if (raw == null) return null;
+    var selfie = raw.trim();
+    if (selfie.isEmpty || selfie == 'auto-detected' || selfie == 'null') return null;
+
+    // Truncated data URIs cannot decode — treat as missing.
+    if (selfie.startsWith('data:image')) {
+      final payload = selfie.contains(',') ? selfie.split(',').last : '';
+      if (payload.length < 64) return null;
+      try {
+        base64Decode(payload);
+        return selfie;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    if (selfie.startsWith('http://') || selfie.startsWith('https://')) return selfie;
+    if (selfie.startsWith('/')) return '${ApiEndpoints.baseUrl}$selfie';
+
+    // Raw base64 without data: prefix
+    if (selfie.length > 100 &&
+        !selfie.contains(r'\') &&
+        !selfie.contains('/') &&
+        !selfie.contains('.')) {
+      try {
+        base64Decode(selfie);
+        return 'data:image/jpeg;base64,$selfie';
+      } catch (_) {}
+    }
+
+    if (File(selfie).existsSync()) return selfie;
+    return '${ApiEndpoints.baseUrl}/$selfie';
   }
 
   Future<Map<String, dynamic>?> checkInOutlet(
@@ -1523,7 +3355,7 @@ class AppProvider extends ChangeNotifier {
   }) async {
     await restoreActiveVisitFromLocalDb();
     if (_activeVisit != null) {
-      if (_activeVisit!['outletId']?.toString() == outletId) {
+      if (isVisitActiveForOutlet(outletId)) {
         if (_attendanceStatus != 'LOGGED_IN') {
           _startAttendanceClock(DateTime.now().toUtc());
         }
@@ -1541,6 +3373,14 @@ class AppProvider extends ChangeNotifier {
         'activeVisitExists': true,
         'message': 'Another outlet visit is already active. Please check out before starting a new visit.',
         'activeOutletId': _activeVisit!['outletId']?.toString(),
+      };
+    }
+
+    if (_selfieRequired && (selfieUrl.isEmpty || selfieUrl == 'auto-detected')) {
+      return {
+        'success': false,
+        'requiresSelfie': true,
+        'message': 'Selfie check-in is required by admin policy.',
       };
     }
 
@@ -1571,7 +3411,10 @@ class AppProvider extends ChangeNotifier {
 
     await checkInAttendance(lat, lng);
 
-    final remoteSelfieUrl = await _resolveSelfieUrl(selfieUrl);
+    final effectiveSelfie = (selfieUrl.isEmpty) ? 'auto-detected' : selfieUrl;
+    final remoteSelfieUrl = effectiveSelfie == 'auto-detected'
+        ? 'auto-detected'
+        : await _resolveSelfieUrl(effectiveSelfie);
     final outletPayload = outlet == null
         ? null
         : {
@@ -1596,16 +3439,17 @@ class AppProvider extends ChangeNotifier {
         managerOverrideFlag: managerOverride,
       );
 
-      if (response.statusCode == 201) {
-        final visit = _mapFrom(response.data['visit']);
+      if (response.statusCode == 201 || response.statusCode == 200) {
+        final payload = _responseData(response);
+        final visit = _mapFrom(payload['visit']);
         visitId = visit['id']?.toString() ?? visitId;
-        if (visit['outletId'] != null) {
+        if (visit['outlet_id'] != null) {
+          resolvedOutletId = visit['outlet_id'].toString();
+        } else if (visit['outletId'] != null) {
           resolvedOutletId = visit['outletId'].toString();
         }
         synced = 1;
         isLocal = false;
-        final serverDistance = double.tryParse(response.data['distanceFromOutletMeters']?.toString() ?? '');
-        if (serverDistance != null) distanceMeters = serverDistance;
       }
     } on DioException catch (e) {
       final data = e.response?.data;
@@ -1687,15 +3531,26 @@ class AppProvider extends ChangeNotifier {
     return Geo.distanceKm(lat1, lon1, lat2, lon2);
   }
 
-  void addProductToOrder(String sku, String name, int qty, double unitPrice) {
+  String _firstNonEmpty(List<dynamic> values) {
+    for (final v in values) {
+      final s = v?.toString().trim() ?? '';
+      if (s.isNotEmpty && s.toLowerCase() != 'null') return s;
+    }
+    return '';
+  }
+
+  void addProductToOrder(String sku, String name, int qty, double unitPrice, {String? productId, String? size}) {
     final existingIdx = _currentOrderItems.indexWhere((item) => item['sku'] == sku);
+    final displayName = (size != null && size.trim().isNotEmpty) ? '$name ($size)' : name;
 
     if (existingIdx != -1) {
       _currentOrderItems[existingIdx]['qty'] += qty;
     } else {
       _currentOrderItems.add({
+        'id': productId ?? sku,
         'sku': sku,
-        'name': name,
+        'name': displayName,
+        'size': size ?? '',
         'qty': qty,
         'unitPrice': unitPrice,
       });
@@ -1730,12 +3585,22 @@ class AppProvider extends ChangeNotifier {
       return false;
     }
 
+    // Stamp ORDER_TOTAL into remarks so admin Logs can show the amount from visit notes.
+    final orderTag = 'ORDER_TOTAL=${_currentOrderTotal.toStringAsFixed(2)}';
+    final notesWithTotal = _currentOrderItems.isEmpty
+        ? trimmedRemarks
+        : (trimmedRemarks.isEmpty
+            ? orderTag
+            : (trimmedRemarks.contains('ORDER_TOTAL=')
+                ? trimmedRemarks
+                : '$trimmedRemarks|$orderTag'));
+
     await DatabaseHelper.instance.update(
       'offline_visits',
       {
         'products_ordered': jsonEncode(_currentOrderItems),
         'sales_value': _currentOrderTotal,
-        'remarks': trimmedRemarks,
+        'remarks': notesWithTotal,
         'synced': 0,
       },
       where: 'id = ?',
@@ -1743,17 +3608,26 @@ class AppProvider extends ChangeNotifier {
     );
 
     try {
+      final serverOutletId = _activeVisit!['serverOutletId']?.toString();
+      final outletId = (serverOutletId != null && serverOutletId.isNotEmpty)
+          ? serverOutletId
+          : _activeVisit!['outletId']?.toString();
       await _api.submitVisitOrder(
         visitId: visitId,
+        outletId: outletId,
         productsOrdered: _currentOrderItems
             .map((item) => {
+                  'id': item['id'],
+                  'productId': item['id'],
                   'sku': item['sku'],
                   'qty': item['qty'],
+                  'quantity': item['qty'],
                   'unitPrice': item['unitPrice'],
+                  'price': item['unitPrice'],
                   'name': item['name'],
                 })
             .toList(),
-        remarks: trimmedRemarks.isEmpty ? null : trimmedRemarks,
+        remarks: notesWithTotal.isEmpty ? null : notesWithTotal,
       );
       await DatabaseHelper.instance.update(
         'offline_visits',
@@ -1767,9 +3641,25 @@ class AppProvider extends ChangeNotifier {
 
     _activeVisit!['productsOrdered'] = _currentOrderItems;
     _activeVisit!['salesValue'] = _currentOrderTotal;
-    _activeVisit!['remarks'] = trimmedRemarks;
+    _activeVisit!['remarks'] = notesWithTotal;
+    _applyRemarksToPlannedOutlet(_activeVisit!['outletId']?.toString(), trimmedRemarks);
     notifyListeners();
     return true;
+  }
+
+  void _applyRemarksToPlannedOutlet(String? outletId, String remarks) {
+    if (outletId == null || outletId.isEmpty) return;
+    for (var i = 0; i < _plannedOutlets.length; i++) {
+      final o = _plannedOutlets[i];
+      if (o is! Map || o['id']?.toString() != outletId) continue;
+      final copy = Map<String, dynamic>.from(o);
+      copy['visitRemarks'] = remarks;
+      copy['remarks'] = remarks;
+      // If quick remark includes Next Visit and no date yet, leave date to schedule dialog.
+      _plannedOutlets[i] = copy;
+      break;
+    }
+    _persistTodayPlanLocally();
   }
 
   Future<bool> checkoutOutlet() async {
@@ -1789,7 +3679,32 @@ class AppProvider extends ChangeNotifier {
     );
 
     try {
-      await _api.checkoutVisit(visitId);
+      double lat = 0;
+      double lng = 0;
+      try {
+        final pos = await DeviceLocation.resolvePosition(timeLimit: const Duration(seconds: 8));
+        if (pos != null) {
+          lat = pos.latitude;
+          lng = pos.longitude;
+        }
+      } catch (_) {}
+
+      // Pass remarks (includes ORDER_TOTAL=…) so admin Logs can read sales from visit notes.
+      var checkoutNotes = _activeVisit?['remarks']?.toString() ?? '';
+      final sales = double.tryParse(_activeVisit?['salesValue']?.toString() ?? '') ?? _currentOrderTotal;
+      if (sales > 0 && !checkoutNotes.contains('ORDER_TOTAL=')) {
+        checkoutNotes = checkoutNotes.isEmpty
+            ? 'ORDER_TOTAL=${sales.toStringAsFixed(2)}'
+            : '$checkoutNotes|ORDER_TOTAL=${sales.toStringAsFixed(2)}';
+      }
+
+      await _api.checkoutVisit(
+        visitId,
+        latitude: lat,
+        longitude: lng,
+        outcome: 'completed',
+        notes: checkoutNotes.isEmpty ? null : checkoutNotes,
+      );
       await DatabaseHelper.instance.update(
         'offline_visits',
         {'synced': 1},
@@ -1801,25 +3716,18 @@ class AppProvider extends ChangeNotifier {
     }
 
     _markOutletVisitStatus(outletId, 'COMPLETED');
+    final remarks = (_activeVisit?['remarks'] ?? '').toString();
+    if (remarks.isNotEmpty) {
+      _applyRemarksToPlannedOutlet(outletId?.toString(), remarks);
+    }
 
     _activeVisit = null;
     _currentOrderItems = [];
     _currentOrderTotal = 0.0;
 
-    final localCompleted = await DatabaseHelper.instance.queryAll('offline_visits', where: 'checkout_time IS NOT NULL');
-    _completedVisitsCount = localCompleted.length;
-    if (_plannedVisitsCount > 0) {
-      _planProgressPercentage = (_completedVisitsCount / _plannedVisitsCount) * 100.0;
-    } else {
-      _planProgressPercentage = 0.0;
-    }
-
-    if (_todayPlan != null) {
-      _todayPlan!['completed_visits'] = _completedVisitsCount;
-      _todayPlan!['completedVisits'] = _completedVisitsCount;
-    }
-
-    fetchTodayPlan();
+    _recomputePlanProgressFromOutlets();
+    await _persistTodayPlanLocally();
+    // Do NOT call fetchTodayPlan() here — production plan endpoint resets all outlets to PENDING.
     notifyListeners();
     return true;
   }
@@ -1866,41 +3774,206 @@ class AppProvider extends ChangeNotifier {
     }).toList();
   }
 
+  Future<void> fetchFieldSettings() async {
+    try {
+      final response = await _apiClient.get(ApiEndpoints.adminSettings);
+      if (response.statusCode == 200) {
+        final data = _mapFrom(response.data);
+        _selfieRequired = data['selfieRequired'] == true;
+        final minutes = int.tryParse(data['minVisitDurationMinutes']?.toString() ?? '');
+        if (minutes != null) _minimumVisitDurationMinutes = minutes.clamp(1, 120);
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool('selfie_required', _selfieRequired);
+        await prefs.setInt('minimum_visit_duration_minutes', _minimumVisitDurationMinutes);
+        notifyListeners();
+      }
+    } catch (e) {
+      print('fetchFieldSettings failed (using local defaults): $e');
+    }
+  }
+
   Future<void> setMinimumVisitDurationMinutes(int minutes) async {
-    final safeMinutes = minutes.clamp(1, 120);
+    final safeMinutes = minutes.clamp(1, 480);
     _minimumVisitDurationMinutes = safeMinutes;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt('minimum_visit_duration_minutes', safeMinutes);
     notifyListeners();
+    await _persistFieldSettings();
   }
 
-  Future<String> exportVisitsCsv() async {
-    final visits = await DatabaseHelper.instance.queryAll('offline_visits');
-    final buffer = StringBuffer();
-    buffer.writeln('Visit ID,Outlet ID,Check-in,Check-out,Latitude,Longitude,Address,Remarks,Products,Sales Value,Manager Override,Auto Detected');
+  Future<void> setSelfieRequired(bool required) async {
+    _selfieRequired = required;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('selfie_required', required);
+    notifyListeners();
+    await _persistFieldSettings();
+  }
 
-    for (final visit in visits) {
-      final productNames = _productNamesForCsv(visit['products_ordered']);
-      buffer.writeln([
-        visit['id'],
-        visit['outlet_id'],
-        visit['checkin_time'],
-        visit['checkout_time'] ?? '',
-        visit['gps_lat'],
-        visit['gps_lng'],
-        visit['address'] ?? '',
-        visit['remarks'] ?? '',
-        productNames,
-        visit['sales_value'] ?? 0.0,
-        visit['manager_override'] == 1 ? 'Yes' : 'No',
-        visit['auto_detected'] == 1 ? 'Yes' : 'No',
-      ].map(_csvCell).join(','));
+  Future<void> _persistFieldSettings() async {
+    try {
+      await _apiClient.patch(ApiEndpoints.adminSettings, data: {
+        'selfieRequired': _selfieRequired,
+        'minVisitDurationMinutes': _minimumVisitDurationMinutes,
+      });
+    } catch (e) {
+      print('Persist field settings failed: $e');
+    }
+  }
+
+  Future<String> exportVisitsCsv({bool share = false}) async {
+    // Prefer org-wide visits from API so manager/admin exports are not empty
+    // (local offline_visits only has visits from this device).
+    final rows = <List<dynamic>>[];
+    try {
+      final visits = await _api.production.listVisits();
+      Map<String, Map<String, dynamic>> usersById = {};
+      Map<String, Map<String, dynamic>> outletsById = {};
+      try {
+        final users = await _api.production.adminUsers();
+        for (final u in users) {
+          final id = u['id']?.toString();
+          if (id != null) usersById[id] = u;
+        }
+      } catch (_) {}
+      try {
+        final outlets = await _api.production.outlets();
+        for (final o in outlets) {
+          final id = o['id']?.toString();
+          if (id != null) outletsById[id] = o;
+        }
+      } catch (_) {}
+
+      for (final visit in visits) {
+        final userId = visit['user_id']?.toString() ?? '';
+        final outletId = visit['outlet_id']?.toString() ?? '';
+        final user = usersById[userId] ?? {};
+        final outlet = outletsById[outletId] ?? {};
+        final role = (user['role'] ?? '').toString().toLowerCase();
+        // Export field executive work only.
+        if (role.isNotEmpty && role != 'executive' && role != 'sales_executive') {
+          // Keep unknown-role visits (older payloads) if user missing role.
+          if (user.isNotEmpty) continue;
+        }
+
+        final checkIn = visit['check_in_at']?.toString() ?? visit['checkInTime']?.toString() ?? '';
+        final checkOut = visit['check_out_at']?.toString() ?? visit['checkOutTime']?.toString() ?? '';
+        final stay = _formatStayDuration(checkIn, checkOut);
+        final lat = visit['check_in_lat'] ?? visit['start_latitude'] ?? visit['gpsLat'] ?? '';
+        final lng = visit['check_in_lng'] ?? visit['start_longitude'] ?? visit['gpsLng'] ?? '';
+        final location = outlet['address'] ??
+            visit['check_in_address'] ??
+            visit['address'] ??
+            ((lat.toString().isNotEmpty && lng.toString().isNotEmpty) ? 'GPS: $lat, $lng' : '');
+
+        rows.add([
+          user['name'] ?? user['email'] ?? 'Executive',
+          user['email'] ?? '',
+          outlet['name'] ?? 'Outlet',
+          location,
+          checkIn,
+          checkOut,
+          stay,
+          lat,
+          lng,
+          visit['notes'] ?? visit['remarks'] ?? '',
+          visit['status'] ?? '',
+        ]);
+      }
+    } catch (e) {
+      print('Org visits export failed, falling back to local: $e');
     }
 
-    final directory = await getApplicationDocumentsDirectory();
-    final file = File('${directory.path}/marketing_visit_export_${DateTime.now().millisecondsSinceEpoch}.csv');
-    await file.writeAsString(buffer.toString());
+    if (rows.isEmpty) {
+      final localVisits = await DatabaseHelper.instance.queryAll('offline_visits');
+      for (final visit in localVisits) {
+        final checkIn = visit['checkin_time']?.toString() ?? '';
+        final checkOut = visit['checkout_time']?.toString() ?? '';
+        final planned = _findOutletById(visit['outlet_id']?.toString() ?? '');
+        rows.add([
+          _email?.split('@').first ?? 'Executive',
+          _email ?? '',
+          planned?['name'] ?? 'Outlet',
+          visit['address'] ?? planned?['address'] ?? '',
+          checkIn,
+          checkOut,
+          _formatStayDuration(checkIn, checkOut),
+          visit['gps_lat'] ?? '',
+          visit['gps_lng'] ?? '',
+          visit['remarks'] ?? '',
+          visit['checkout_time'] != null ? 'completed' : 'open',
+        ]);
+      }
+    }
+
+    final buffer = StringBuffer();
+    buffer.writeln(
+      'Executive Name,Executive Email,Outlet,Location,Check-in,Check-out,Time Stayed,Latitude,Longitude,Remarks,Status',
+    );
+    for (final row in rows) {
+      buffer.writeln(row.map(_csvCell).join(','));
+    }
+
+    final fileName = 'marketing_executive_visits_${DateTime.now().millisecondsSinceEpoch}.csv';
+    // Prefer a location users can open in Files / Downloads.
+    final file = await _writeExportFile(fileName, buffer.toString());
+
+    // Always offer the system share sheet so the file can be saved to Downloads / Drive / Files.
+    // (App-private paths are not visible in the phone Files app.)
+    try {
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [XFile(file.path, mimeType: 'text/csv', name: fileName)],
+          subject: 'Executive visit report',
+          text: 'Marketing Executives visit report — save to Downloads or Files',
+        ),
+      );
+    } catch (e) {
+      print('Share export failed: $e');
+    }
     return file.path;
+  }
+
+  /// Writes CSV where Android users can find it (public Download when allowed).
+  Future<File> _writeExportFile(String fileName, String contents) async {
+    if (Platform.isAndroid) {
+      final candidates = <Directory>[
+        Directory('/storage/emulated/0/Download'),
+        Directory('/storage/emulated/0/Downloads'),
+      ];
+      for (final dir in candidates) {
+        try {
+          if (await dir.exists()) {
+            final file = File('${dir.path}/$fileName');
+            await file.writeAsString(contents);
+            return file;
+          }
+        } catch (_) {
+          // Scoped storage may block — fall through.
+        }
+      }
+    }
+
+    Directory directory;
+    try {
+      directory = await getDownloadsDirectory() ?? await getApplicationDocumentsDirectory();
+    } catch (_) {
+      directory = await getApplicationDocumentsDirectory();
+    }
+    final file = File('${directory.path}/$fileName');
+    await file.writeAsString(contents);
+    return file;
+  }
+
+  String _formatStayDuration(String? checkInIso, String? checkOutIso) {
+    final start = DateTime.tryParse(checkInIso ?? '');
+    final end = DateTime.tryParse(checkOutIso ?? '');
+    if (start == null || end == null) return '';
+    final mins = end.difference(start).inMinutes;
+    if (mins < 0) return '';
+    if (mins < 60) return '$mins min';
+    final h = mins ~/ 60;
+    final m = mins % 60;
+    return m == 0 ? '${h}h' : '${h}h ${m}m';
   }
 
   String _productNamesForCsv(dynamic rawProducts) {
@@ -1937,36 +4010,58 @@ class AppProvider extends ChangeNotifier {
         outlet['visitStatus'] = status;
       }
     }
+    _recomputePlanProgressFromOutlets();
+    // Fire-and-forget persist so completed visits survive refresh.
+    _persistTodayPlanLocally();
   }
 
   // 6. Exception & Incident Reporting
   Future<void> fetchUserIncidents() async {
-    if (_userId != null) {
-      try {
-        final response = await _api.userIncidents(_userId!);
-        if (response.statusCode == 200) {
-          final raw = (response.data['incidents'] as List<dynamic>?) ?? [];
-          _userIncidents = raw.map((row) {
-            final item = Map<String, dynamic>.from(row as Map);
-            return {
-              'id': item['id'],
-              'incidentType': item['incidentType'] ?? 'OTHER',
-              'description': item['description'] ?? '',
-              'imageUrls': item['imageUrls'] ?? [],
-              'videoUrls': item['videoUrls'] ?? [],
-              'resolutionStatus': item['resolutionStatus'] ?? 'OPEN',
-              'createdAt': item['createdAt']?.toString() ?? '',
-            };
-          }).toList();
-          notifyListeners();
-          return;
-        }
-      } catch (e) {
-        print('Fetch incidents API failed: $e');
+    final orgId = _region;
+    try {
+      final response = await _api.userIncidents(_userId ?? '');
+      if (response.statusCode == 200) {
+        final raw = _responseList(response, 'incidents');
+        _userIncidents = raw.map((row) {
+          final item = row is Map ? Map<String, dynamic>.from(row) : <String, dynamic>{};
+          final rawMap = item['raw'] is Map ? Map<String, dynamic>.from(item['raw'] as Map) : item;
+          final status = (item['resolutionStatus'] ?? item['status'] ?? rawMap['status'] ?? 'OPEN')
+              .toString()
+              .toUpperCase();
+          final normalizedStatus = (status == 'RESOLVED' || status == 'CLOSED') ? 'RESOLVED' : 'OPEN';
+          return {
+            'id': item['id'] ?? rawMap['id'],
+            'incidentType': item['incidentType'] ?? item['type'] ?? rawMap['type'] ?? 'OTHER',
+            'description': item['description'] ?? rawMap['description'] ?? '',
+            'imageUrls': item['imageUrls'] ?? [],
+            'videoUrls': item['videoUrls'] ?? [],
+            'resolutionStatus': normalizedStatus,
+            'createdAt': item['createdAt']?.toString() ?? rawMap['created_at']?.toString() ?? '',
+            'userId': item['userId'] ?? rawMap['user_id'],
+            'orgId': rawMap['org_id']?.toString() ?? item['orgId']?.toString(),
+            'raw': rawMap,
+          };
+        }).where((inc) {
+          // Hard isolation: never show another organisation's incidents.
+          if (orgId == null || orgId.isEmpty) return true;
+          final incidentOrg = inc['orgId']?.toString();
+          if (incidentOrg == null || incidentOrg.isEmpty) return false;
+          return incidentOrg == orgId;
+        }).toList();
+        notifyListeners();
+        return;
       }
+    } catch (e) {
+      print('Fetch incidents API failed: $e');
     }
 
     try {
+      // Avoid leaking previous-org offline incidents into another tenant session.
+      if (_isAdminRole()) {
+        _userIncidents = [];
+        notifyListeners();
+        return;
+      }
       final localIncidents = await DatabaseHelper.instance.queryAll('offline_incidents');
       _userIncidents = localIncidents.map((row) {
         return {
@@ -1981,11 +4076,51 @@ class AppProvider extends ChangeNotifier {
               : [],
           'resolutionStatus': 'OPEN',
           'createdAt': row['created_at'] ?? DateTime.now().toUtc().toIso8601String(),
+          'orgId': orgId,
         };
       }).toList();
       notifyListeners();
     } catch (e) {
       print('Fetch local incidents failed: $e');
+    }
+  }
+
+  Future<bool> resolveIncident(String incidentId, {String notes = 'Resolved by admin'}) async {
+    try {
+      final response = await _apiClient.patch(
+        ApiEndpoints.incidentResolve(incidentId),
+        data: {'resolution_notes': notes},
+      );
+      if (response.statusCode != null && response.statusCode! >= 400) {
+        _lastActionError = ApiClient.errorMessage(
+              DioException(requestOptions: response.requestOptions, response: response),
+            ) ??
+            'Could not resolve incident.';
+        return false;
+      }
+      final idx = _userIncidents.indexWhere((i) => i is Map && i['id']?.toString() == incidentId);
+      if (idx >= 0) {
+        _userIncidents[idx] = {
+          ...Map<String, dynamic>.from(_userIncidents[idx] as Map),
+          'resolutionStatus': 'RESOLVED',
+        };
+      }
+      try {
+        // Best-effort local status update; schema may not have this column.
+        await DatabaseHelper.instance.update(
+          'offline_incidents',
+          {'synced': 1},
+          where: 'id = ?',
+          whereArgs: [incidentId],
+        );
+      } catch (_) {}
+      notifyListeners();
+      await fetchAdminStats();
+      return true;
+    } catch (e) {
+      _lastActionError = e.toString();
+      print('Resolve incident failed: $e');
+      return false;
     }
   }
 
@@ -2057,121 +4192,481 @@ class AppProvider extends ChangeNotifier {
     return true;
   }
 
-  // 7. Smart Lead Generation — potential new shops to convert into outlets
+  // 7. Smart Lead Generation — potential new shops (Business Finder API)
   Future<void> findNearbyLeads(double lat, double lng, String category) async {
-    try {
-      final response = await _api.nearbyLeads(lat: lat, lng: lng, category: category);
-      if (response.statusCode == 200) {
-        final rawList = (response.data['leads'] as List<dynamic>?) ??
-            (response.data['data'] as List<dynamic>?) ??
-            [];
-        _nearbyLeads = rawList.map((item) {
-          return {
-            'id': item['id']?.toString() ?? item['placeId']?.toString() ?? _uuid.v4(),
-            'businessName': item['businessName'] ?? item['name'] ?? 'Unknown Business',
-            'businessCategory': item['businessCategory'] ?? item['category'] ?? category,
-            'distanceMeters': item['distanceMeters'] ?? item['distance_meters'] ?? '?',
-            'gpsLat': item['gpsLat'] ?? item['gps_lat'] ?? lat,
-            'gpsLng': item['gpsLng'] ?? item['gps_lng'] ?? lng,
-            'contactPhone': item['contactPhone'] ?? item['contact_phone'] ?? '',
-            'contactEmail': item['contactEmail'] ?? item['contact_email'] ?? '',
-          };
-        }).toList();
-        notifyListeners();
-        return;
-      }
-    } catch (e) {
-      print('Nearby leads API unavailable: $e');
-    }
+    await searchBusinessDirectory(
+      query: category.replaceAll('_', ' '),
+      latitude: lat,
+      longitude: lng,
+      radiusKm: 5,
+    );
+  }
 
-    _nearbyLeads = [];
+  Future<void> searchBusinessDirectory({
+    required String query,
+    String? area,
+    double? latitude,
+    double? longitude,
+    double radiusKm = 5,
+  }) async {
+    try {
+      final results = await _businessData.searchBusinesses(
+        query: query,
+        area: area,
+        latitude: latitude,
+        longitude: longitude,
+        radiusKm: radiusKm,
+      );
+      _nearbyLeads = results;
+      notifyListeners();
+    } catch (e) {
+      print('Business directory search failed: $e');
+      _nearbyLeads = [];
+      notifyListeners();
+      rethrow;
+    }
+  }
+
+  /// Replace nearby search results (used when merging multi-area prospect searches).
+  void setNearbyLeads(List<Map<String, dynamic>> leads) {
+    _nearbyLeads = leads;
     notifyListeners();
   }
 
   Future<void> fetchSavedLeads() async {
+    List<Map<String, dynamic>> apiLeads = [];
     try {
       final response = await _api.listLeads();
       if (response.statusCode == 200) {
-        final rawList = (response.data['leads'] as List<dynamic>?) ??
-            (response.data['data'] as List<dynamic>?) ??
-            [];
-        _savedLeads = rawList.map((item) {
+        final rawList = _responseList(response, 'leads');
+        apiLeads = rawList.map((item) {
+          final map = item is Map ? Map<String, dynamic>.from(item) : <String, dynamic>{};
           return {
-            'id': item['id'],
-            'businessName': item['businessName'] ?? item['name'] ?? item['business_name'] ?? 'Unknown Lead',
-            'leadStatus': (item['leadStatus'] ?? item['status'] ?? item['lead_status'] ?? 'NEW')
+            'id': map['id'],
+            'businessName': map['businessName'] ?? map['name'] ?? map['business_name'] ?? 'Unknown Lead',
+            'businessCategory': map['businessCategory'] ?? map['business_type'] ?? map['business_category'] ?? 'Business',
+            'contactPhone': map['contactPhone'] ?? map['phone'] ?? map['contact_phone'] ?? '',
+            'contactEmail': map['contactEmail'] ?? map['email'] ?? map['contact_email'] ?? '',
+            'address': map['address'] ?? '',
+            'gpsLat': map['gpsLat'] ?? map['gps_lat'] ?? 0,
+            'gpsLng': map['gpsLng'] ?? map['gps_lng'] ?? 0,
+            'leadStatus': (map['leadStatus'] ?? map['status'] ?? map['lead_status'] ?? 'NEW')
                 .toString()
                 .toUpperCase(),
           };
         }).toList();
-        notifyListeners();
-        return;
       }
     } catch (e) {
       print('Fetch saved leads failed: $e. Loading from offline database.');
     }
 
+    List<Map<String, dynamic>> localLeads = [];
     try {
-      final localLeads = await DatabaseHelper.instance.queryAll('offline_leads');
-      _savedLeads = localLeads.map((item) {
+      final rows = await DatabaseHelper.instance.queryAll('offline_leads');
+      localLeads = rows.map((item) {
         return {
           'id': item['id'],
           'businessName': item['business_name'] ?? 'Unknown Lead',
+          'businessCategory': item['business_category'] ?? 'Business',
+          'contactPhone': item['contact_phone'] ?? '',
+          'contactEmail': item['contact_email'] ?? '',
+          'address': item['address'] ?? '',
+          'gpsLat': item['gps_lat'] ?? 0,
+          'gpsLng': item['gps_lng'] ?? 0,
           'leadStatus': (item['lead_status'] ?? 'NEW').toString().toUpperCase(),
         };
       }).toList();
-      notifyListeners();
     } catch (dbError) {
       print('Fetch offline leads failed: $dbError');
     }
+
+    final byId = <String, Map<String, dynamic>>{};
+    for (final lead in localLeads) {
+      final id = lead['id']?.toString();
+      if (id != null) byId[id] = lead;
+    }
+    for (final lead in apiLeads) {
+      final id = lead['id']?.toString();
+      if (id != null) {
+        final existing = byId[id];
+        // Prefer converted status when merging API + local for same id.
+        if (existing != null &&
+            (existing['leadStatus']?.toString().toUpperCase() == 'CONVERTED') &&
+            (lead['leadStatus']?.toString().toUpperCase() != 'CONVERTED')) {
+          byId[id] = {...lead, 'leadStatus': 'CONVERTED'};
+        } else {
+          byId[id] = lead;
+        }
+      }
+    }
+    _savedLeads = _dedupeSavedLeadsList(byId.values.toList());
+    notifyListeners();
   }
 
-  Future<bool> saveLeadRecord(String name, String category, String phone, String email, double lat, double lng) async {
+  String _leadIdentityKey(Map lead) {
+    return _outletIdentityKey(
+      lead['businessName']?.toString(),
+      lead['address']?.toString(),
+    );
+  }
+
+  /// One card per shop (name+address). Prefer CONVERTED when duplicates exist.
+  List<Map<String, dynamic>> _dedupeSavedLeadsList(List<Map<String, dynamic>> leads) {
+    final byKey = <String, Map<String, dynamic>>{};
+    for (final lead in leads) {
+      final key = _leadIdentityKey(lead);
+      final id = lead['id']?.toString() ?? '';
+      final useKey = key != '|' ? key : 'id:$id';
+      final existing = byKey[useKey];
+      if (existing == null) {
+        byKey[useKey] = lead;
+        continue;
+      }
+      final existingConverted = existing['leadStatus']?.toString().toUpperCase() == 'CONVERTED';
+      final incomingConverted = lead['leadStatus']?.toString().toUpperCase() == 'CONVERTED';
+      if (incomingConverted && !existingConverted) {
+        byKey[useKey] = lead;
+      }
+    }
+    return byKey.values.toList();
+  }
+
+  Future<void> _markMatchingLeadsConverted({
+    required String name,
+    required String address,
+    required String preferredLeadId,
+    String? outletId,
+  }) async {
+    final identity = _outletIdentityKey(name, address);
+    for (var i = 0; i < _savedLeads.length; i++) {
+      final item = _savedLeads[i];
+      if (item is! Map) continue;
+      final sameId = item['id']?.toString() == preferredLeadId;
+      final sameShop = identity != '|' && _leadIdentityKey(item) == identity;
+      if (!sameId && !sameShop) continue;
+      _savedLeads[i] = {
+        ...Map<String, dynamic>.from(item),
+        'leadStatus': 'CONVERTED',
+        if (outletId != null) 'converted_outlet_id': outletId,
+      };
+    }
+    _savedLeads = _dedupeSavedLeadsList(
+      _savedLeads.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList(),
+    );
+
+    try {
+      final rows = await DatabaseHelper.instance.queryAll('offline_leads');
+      for (final row in rows) {
+        final rowName = row['business_name']?.toString() ?? '';
+        final rowAddress = row['address']?.toString() ?? '';
+        final sameId = row['id']?.toString() == preferredLeadId;
+        final sameShop = identity != '|' && _outletIdentityKey(rowName, rowAddress) == identity;
+        if (!sameId && !sameShop) continue;
+        await DatabaseHelper.instance.update(
+          'offline_leads',
+          {'lead_status': 'CONVERTED', 'synced': 1},
+          where: 'id = ?',
+          whereArgs: [row['id']],
+        );
+      }
+    } catch (_) {}
+  }
+
+  Future<bool> saveLeadRecord(
+    String name,
+    String category,
+    String phone,
+    String email,
+    double lat,
+    double lng, {
+    String address = '',
+  }) async {
+    final identity = _outletIdentityKey(name, address);
+
+    // Already saved (same shop) — keep a single entry.
+    if (identity != '|') {
+      for (final existing in _savedLeads) {
+        if (existing is Map && _leadIdentityKey(existing) == identity) {
+          _lastActionError = null;
+          await fetchSavedLeads();
+          return true;
+        }
+      }
+      try {
+        final rows = await DatabaseHelper.instance.queryAll('offline_leads');
+        for (final row in rows) {
+          if (_outletIdentityKey(row['business_name']?.toString(), row['address']?.toString()) == identity) {
+            await fetchSavedLeads();
+            return true;
+          }
+        }
+      } catch (_) {}
+    }
+
+    String leadId = _uuid.v4();
+    var synced = 0;
+
     try {
       final response = await _api.saveLead({
+        'name': name,
         'businessName': name,
         'businessCategory': category,
+        'category': category,
+        'phone': phone,
         'contactPhone': phone,
+        'email': email,
         'contactEmail': email,
+        'address': address,
         'gpsLat': lat,
         'gpsLng': lng,
       });
-      if (response.statusCode == 201) {
-        fetchSavedLeads();
-        return true;
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        final created = _mapFrom(response.data['lead'] ?? response.data['data']);
+        // Nested unwrap when FieldApiService wraps again
+        final nested = _mapFrom(_mapFrom(response.data)['data']);
+        final leadMap = created.isNotEmpty ? created : _mapFrom(nested['lead']);
+        leadId = leadMap['id']?.toString() ?? leadId;
+        synced = 1;
       }
     } catch (e) {
-      print('Save lead API failed. Queuing locally.');
+      print('Save lead API failed. Queuing locally: $e');
     }
 
     await DatabaseHelper.instance.insert('offline_leads', {
-      'id': _uuid.v4(),
+      'id': leadId,
       'business_name': name,
       'business_category': category,
       'contact_phone': phone,
       'contact_email': email,
+      'address': address,
       'gps_lat': lat,
       'gps_lng': lng,
       'lead_status': 'NEW',
       'created_at': DateTime.now().toUtc().toIso8601String(),
-      'synced': 0,
+      'synced': synced,
     });
     await fetchSavedLeads();
     return true;
   }
 
-  Future<bool> convertLeadToOutlet(String leadId) async {
-    try {
-      final response = await _api.convertLead(leadId);
-      if (response.statusCode == 200 || response.statusCode == 201) {
-        await fetchSavedLeads();
-        await fetchTodayPlan();
-        return true;
-      }
-    } catch (e) {
-      print('Convert lead failed: $e');
+  String? _convertingLeadId;
+  String? get convertingLeadId => _convertingLeadId;
+  bool get isConvertingLead => _convertingLeadId != null;
+
+  String _outletIdentityKey(String? name, String? address) {
+    final n = (name ?? '').trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+    final a = (address ?? '').trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+    return '$n|$a';
+  }
+
+  /// Removes duplicate planned outlets (same id or same name+address).
+  void dedupePlannedOutlets() {
+    final before = _plannedOutlets.length;
+    _dedupePlannedOutlets();
+    if (_plannedOutlets.length != before) {
+      _persistTodayPlanLocally();
+      notifyListeners();
     }
-    return false;
+  }
+
+  void _dedupePlannedOutlets() {
+    final seenIds = <String>{};
+    final seenKeys = <String>{};
+    final seenNames = <String>{};
+    final unique = <dynamic>[];
+    for (final outlet in _plannedOutlets) {
+      if (outlet is! Map) continue;
+      final id = outlet['id']?.toString() ?? '';
+      final nameOnly = (outlet['name'] ?? '')
+          .toString()
+          .trim()
+          .toLowerCase()
+          .replaceAll(RegExp(r'\s+'), ' ');
+      final key = _outletIdentityKey(outlet['name']?.toString(), outlet['address']?.toString());
+      // Same server id, same name+address, or same shop name → keep first only.
+      if (id.isNotEmpty && !seenIds.add(id)) continue;
+      if (key != '|' && !seenKeys.add(key)) continue;
+      if (nameOnly.isNotEmpty && !seenNames.add(nameOnly)) continue;
+      unique.add(outlet);
+    }
+    if (unique.length != _plannedOutlets.length) {
+      _plannedOutlets = unique;
+      _plannedVisitsCount = _plannedOutlets.length;
+      if (_todayPlan != null) _todayPlan!['planned_visits'] = _plannedVisitsCount;
+      if (_plannedVisitsCount > 0) {
+        _completedVisitsCount = _plannedOutlets.where((o) => o is Map && o['visitStatus'] == 'COMPLETED').length;
+        _planProgressPercentage = (_completedVisitsCount / _plannedVisitsCount) * 100.0;
+      }
+    }
+  }
+
+  Future<bool> convertLeadToOutlet(String leadId) async {
+    if (_convertingLeadId != null) {
+      _lastActionError = 'Conversion already in progress. Please wait.';
+      return false;
+    }
+
+    _convertingLeadId = leadId;
+    _lastActionError = null;
+    notifyListeners();
+
+    try {
+      final lead = await _resolveLeadDetails(leadId);
+      if (lead == null) {
+        _lastActionError = 'Lead details not found. Save the prospect again, then convert.';
+        return false;
+      }
+
+      final status = (lead['leadStatus'] ?? '').toString().toUpperCase();
+
+      final name = lead['businessName']?.toString() ?? 'Outlet';
+      final category = lead['businessCategory']?.toString() ?? 'Business';
+      final phone = lead['contactPhone']?.toString() ?? '';
+      final email = lead['contactEmail']?.toString() ?? '';
+      final address = (lead['address']?.toString().isNotEmpty ?? false)
+          ? lead['address'].toString()
+          : '$name ($category)';
+      final lat = double.tryParse(lead['gpsLat']?.toString() ?? '') ?? 0.0;
+      final lng = double.tryParse(lead['gpsLng']?.toString() ?? '') ?? 0.0;
+      final identity = _outletIdentityKey(name, address);
+
+      // Any duplicate of this shop already converted → sync all copies and stop.
+      final alreadyConvertedTwin = _savedLeads.whereType<Map>().any((l) {
+        if (l['leadStatus']?.toString().toUpperCase() != 'CONVERTED') return false;
+        return identity != '|' && _leadIdentityKey(l) == identity;
+      });
+      if (status == 'CONVERTED' || alreadyConvertedTwin) {
+        await _markMatchingLeadsConverted(
+          name: name,
+          address: address,
+          preferredLeadId: leadId,
+        );
+        _lastActionError = 'This lead is already converted.';
+        return false;
+      }
+
+      // Already on today's plan (same shop) — mark converted, do not add again.
+      final existingPlanned = _plannedOutlets.cast<dynamic>().whereType<Map>().where((o) {
+        final idMatch = o['id']?.toString() == lead['converted_outlet_id']?.toString();
+        final keyMatch = _outletIdentityKey(o['name']?.toString(), o['address']?.toString()) == identity;
+        return idMatch || (identity != '|' && keyMatch);
+      }).toList();
+
+      String outletId = existingPlanned.isNotEmpty
+          ? existingPlanned.first['id']?.toString() ?? _uuid.v4()
+          : _uuid.v4();
+
+      if (existingPlanned.isEmpty) {
+        try {
+          final created = await _api.production.convertLead(leadId, lead: {
+            'id': leadId,
+            'name': name,
+            'businessName': name,
+            'phone': phone,
+            'contactPhone': phone,
+            'email': email,
+            'contactEmail': email,
+            'address': address,
+            'gpsLat': lat,
+            'gpsLng': lng,
+            'latitude': lat,
+            'longitude': lng,
+          });
+          if (created != null && created['id'] != null) {
+            outletId = created['id'].toString();
+          }
+        } catch (e) {
+          print('Convert lead API failed: $e');
+          _lastActionError = 'Could not convert on server. Try again.';
+          return false;
+        }
+
+        if (_todayPlan == null) {
+          _todayPlan = {
+            'id': 'local-plan-${_uuid.v4()}',
+            'route_id': 'converted',
+            'planned_visits': 0,
+          };
+        }
+
+        final alreadyPlanned = _plannedOutlets.any((o) {
+          if (o is! Map) return false;
+          if (o['id']?.toString() == outletId) return true;
+          return _outletIdentityKey(o['name']?.toString(), o['address']?.toString()) == identity;
+        });
+        if (!alreadyPlanned) {
+          // Newest converted outlet at the top of Planned.
+          _plannedOutlets = [
+            {
+              'id': outletId,
+              'name': name,
+              'address': address,
+              'latitude': lat,
+              'longitude': lng,
+              'visitStatus': 'PENDING',
+              'source': 'converted_lead',
+              'fromLeadId': leadId,
+            },
+            ..._plannedOutlets,
+          ];
+        }
+        _dedupePlannedOutlets();
+        _plannedVisitsCount = _plannedOutlets.length;
+        _todayPlan!['planned_visits'] = _plannedVisitsCount;
+        await _persistTodayPlanLocally();
+      }
+
+      await _markMatchingLeadsConverted(
+        name: name,
+        address: address,
+        preferredLeadId: leadId,
+        outletId: outletId,
+      );
+
+      _lastActionError = null;
+      notifyListeners();
+      return true;
+    } finally {
+      _convertingLeadId = null;
+      notifyListeners();
+    }
+  }
+
+  Future<Map<String, dynamic>?> _resolveLeadDetails(String leadId) async {
+    Map<String, dynamic>? fromMemory;
+    for (final item in _savedLeads) {
+      if (item is Map && item['id']?.toString() == leadId) {
+        fromMemory = Map<String, dynamic>.from(item);
+        break;
+      }
+    }
+    if (fromMemory != null &&
+        (fromMemory['gpsLat'] != null || fromMemory['businessName'] != null)) {
+      return fromMemory;
+    }
+
+    try {
+      final rows = await DatabaseHelper.instance.queryAll(
+        'offline_leads',
+        where: 'id = ?',
+        whereArgs: [leadId],
+      );
+      if (rows.isEmpty) return fromMemory;
+      final row = rows.first;
+      return {
+        'id': row['id'],
+        'businessName': row['business_name'],
+        'businessCategory': row['business_category'],
+        'contactPhone': row['contact_phone'] ?? '',
+        'contactEmail': row['contact_email'] ?? '',
+        'address': row['address'] ?? '',
+        'gpsLat': row['gps_lat'] ?? 0,
+        'gpsLng': row['gps_lng'] ?? 0,
+        'leadStatus': row['lead_status'] ?? 'NEW',
+      };
+    } catch (_) {
+      return fromMemory;
+    }
   }
 
   // 8. Intelligent Route Optimization
@@ -2185,6 +4680,9 @@ class AppProvider extends ChangeNotifier {
       final longitude = double.tryParse(outlet['longitude']?.toString() ?? '');
 
       if (outletId == null || latitude == null || longitude == null) continue;
+      // Skip Null Island / invalid pins that create world-spanning “routes”.
+      if (latitude.abs() < 0.01 && longitude.abs() < 0.01) continue;
+      if (latitude < -85 || latitude > 85 || longitude < -180 || longitude > 180) continue;
       if (outletIds.isNotEmpty && !outletIds.contains(outletId)) continue;
 
       remainingOutlets.add({
@@ -2193,6 +4691,17 @@ class AppProvider extends ChangeNotifier {
         'longitude': longitude,
       });
     }
+
+    // Drop far outliers from the GPS start so a bad pin can't create a continent-spanning route.
+    remainingOutlets.removeWhere((o) {
+      final d = _calculateHaversineDistance(
+        startLat,
+        startLng,
+        o['latitude'] as double,
+        o['longitude'] as double,
+      );
+      return d > 250;
+    });
 
     if (remainingOutlets.isEmpty) {
       _optimizedRoute = null;
@@ -2378,6 +4887,7 @@ class AppProvider extends ChangeNotifier {
     print('[Sync Engine] Sync complete.');
     if (_role == 'admin' ||
         _role == 'manager' ||
+        _role == 'super_admin' ||
         _role == 'SUPER_ADMIN' ||
         _role == 'REGIONAL_MANAGER' ||
         _role == 'SALES_MANAGER') {
@@ -2397,7 +4907,16 @@ class AppProvider extends ChangeNotifier {
     await fetchAdminLiveVisitsList();
     await fetchAdminLiveGpsList();
     await fetchAdminStats();
+    await fetchOrgSubscription();
+    await fetchUserIncidents();
+    if ((_role ?? '').toLowerCase() == 'super_admin') {
+      await fetchPendingOrganisations();
+      await fetchManagedOrganisations();
+    }
   }
+
+  String? _lastActionError;
+  String? get lastActionError => _lastActionError;
 
   Future<void> fetchAdminStats() async {
     Map<String, dynamic> serverStats = {};
@@ -2442,7 +4961,14 @@ class AppProvider extends ChangeNotifier {
       }
     }
 
-    final openIncidents = localIncidents.length;
+    final openIncidents = _userIncidents.where((i) {
+      if (i is! Map) return false;
+      return (i['resolutionStatus'] ?? 'OPEN').toString().toUpperCase() != 'RESOLVED';
+    }).length;
+
+    final orgFromServer = serverStats['org'] is Map
+        ? Map<String, dynamic>.from(serverStats['org'] as Map)
+        : <String, dynamic>{};
 
     _adminStats = {
       ...serverStats,
@@ -2452,133 +4978,688 @@ class AppProvider extends ChangeNotifier {
       'visits_completed': completedVisits,
       'sales_value_total': salesValueTotal,
       'open_incidents_count': openIncidents,
-      'org': serverStats['org'] ??
-          {
-            'name': 'Alpha Corp Ltd',
-            'email': _email ?? 'admin@alpha.com',
-            'status': 'active',
-          },
+      'org': {
+        ...orgFromServer,
+        'name': orgFromServer['name'] ?? 'Organisation',
+        // Always show the signed-in admin email, not a generic org mailbox.
+        'email': _email ?? orgFromServer['email'] ?? '—',
+        'status': orgFromServer['status'] ?? 'active',
+      },
     };
+    if (_isPlatformSuperAdmin || _isAddPhoneBookOrg) {
+      // Platform owner / AddPhoneBook — never bind a tenant trial to their session UI.
+      _orgSubscription = null;
+    } else if (orgFromServer.isNotEmpty) {
+      _orgSubscription = {...?_orgSubscription, ...orgFromServer};
+      final slug = orgFromServer['slug']?.toString();
+      if (slug != null && slug.isNotEmpty) {
+        _orgSlug = slug;
+      }
+    }
 
     notifyListeners();
   }
 
   Future<void> fetchAdminUsersList() async {
     try {
-      final response = await _apiClient.get(ApiEndpoints.users);
-      if (response.statusCode == 200) {
-        _adminUsersList = response.data['data'] as List<dynamic>? ?? [];
+      final response = await _api.adminUsers();
+      if (response.statusCode != 200) {
+        _adminUsersList = [];
         notifyListeners();
+        return;
       }
-    } catch (e) {
-      print('Fetch admin users list failed: $e. Falling back to local mock list.');
-    }
 
-    if (_adminUsersList.isEmpty) {
-      _adminUsersList = [
-        {
-          'id': 'exec-001',
-          'name': 'Ankit Sharma',
-          'email': 'ankit@alpha.com',
-          'role': 'executive',
-          'status': 'active',
-          'created_at': '2026-06-15T08:00:00Z',
-          'designation': 'Senior Field Executive',
-        },
-        {
-          'id': 'exec-002',
-          'name': 'Priya Patel',
-          'email': 'priya@alpha.com',
-          'role': 'executive',
-          'status': 'active',
-          'created_at': '2026-06-20T09:30:00Z',
-          'designation': 'Area Representative',
-        },
-        {
-          'id': 'exec-003',
-          'name': 'Rohan Das',
-          'email': 'rohan@alpha.com',
-          'role': 'executive',
-          'status': 'inactive',
-          'created_at': '2026-06-22T10:15:00Z',
-          'designation': 'Junior Field Agent',
+      final raw = _responseList(response, 'users');
+      // Attendance / online is not on /users.status (that is account active/inactive).
+      // Derive live presence from open visits + today's visit activity.
+      Map<String, Map<String, dynamic>> visitByUser = {};
+      try {
+        final visits = await _api.production.listVisits();
+        for (final visit in visits) {
+          final userId = visit['user_id']?.toString();
+          if (userId == null || userId.isEmpty) continue;
+          final existing = visitByUser[userId];
+          final checkIn = visit['check_in_at']?.toString();
+          final existingIn = existing?['check_in_at']?.toString();
+          final newer = existing == null ||
+              (checkIn != null &&
+                  existingIn != null &&
+                  checkIn.compareTo(existingIn) > 0) ||
+              (checkIn != null && existingIn == null);
+          if (newer) visitByUser[userId] = Map<String, dynamic>.from(visit);
         }
-      ];
+      } catch (_) {}
+
+      _adminUsersList = raw.map((item) {
+        final u = item is Map ? Map<String, dynamic>.from(item) : <String, dynamic>{};
+        final id = u['id']?.toString() ?? '';
+        final accountStatus = (u['status'] ?? 'active').toString().toLowerCase();
+        final visit = visitByUser[id];
+        final checkInAt = visit?['check_in_at']?.toString() ??
+            u['check_in_at']?.toString() ??
+            u['checkInAt']?.toString();
+        final checkOutAt = visit?['check_out_at']?.toString() ??
+            u['check_out_at']?.toString() ??
+            u['checkOutAt']?.toString();
+        final visitStatus = (visit?['status'] ?? '').toString().toLowerCase();
+        final hasOpenVisit = visit != null &&
+            checkInAt != null &&
+            checkInAt.isNotEmpty &&
+            (checkOutAt == null || checkOutAt.isEmpty) &&
+            visitStatus != 'completed';
+        final checkedInToday = checkInAt != null && _isSameLocalDay(checkInAt, DateTime.now());
+        var isOnline = hasOpenVisit || (checkedInToday && (checkOutAt == null || checkOutAt.isEmpty));
+        // Logged-in manager/admin on this device counts as online (they don't do field visits).
+        if (!isOnline && id.isNotEmpty && id == _userId) {
+          isOnline = true;
+        }
+
+        final role = (u['role'] ?? '').toString().toLowerCase();
+        final isExecutive = role == 'executive' || role == 'sales_executive';
+        final isSelf = id.isNotEmpty && id == _userId;
+        final privilegedTarget =
+            role == 'admin' || role == 'super_admin' || role == 'manager' || role == 'sales_manager' || role == 'regional_manager';
+
+        return {
+          'id': id,
+          'name': u['name'] ?? u['email'] ?? 'User',
+          'email': u['email'] ?? '',
+          'phone': u['phone'] ?? '',
+          'role': u['role'] ?? '',
+          'accountStatus': accountStatus,
+          'status': accountStatus, // keep for older UI
+          'isOnline': isOnline,
+          'designation': u['designation'] ?? u['role'] ?? 'Field Agent',
+          'check_in_at': checkInAt,
+          'check_out_at': checkOutAt,
+          'lastVisitStatus': visitStatus,
+          'lastVisitOutletId': visit?['outlet_id'],
+          // Admin/manager: edit executives only; never delete managers/admins/self.
+          'canEdit': isExecutive,
+          'canDelete': isExecutive && !isSelf && !privilegedTarget,
+          'raw': u,
+        };
+      }).where((u) {
+        return !_isHiddenFromOrgActivity(
+          role: u['role']?.toString(),
+          name: u['name']?.toString(),
+          email: u['email']?.toString(),
+        );
+      }).toList();
+      notifyListeners();
+    } catch (e) {
+      print('Fetch admin users list failed: $e');
+      _adminUsersList = [];
       notifyListeners();
     }
   }
 
-  Future<bool> createExecutive(String name, String email, String password) async {
+  Future<bool> updateExecutive({
+    required String userId,
+    String? name,
+    String? email,
+    String? phone,
+    String? password,
+    String? status,
+    String? designation,
+  }) async {
+    _lastActionError = null;
+    try {
+      final body = <String, dynamic>{
+        if (name != null && name.trim().isNotEmpty) 'name': name.trim(),
+        if (email != null && email.trim().isNotEmpty) 'email': email.trim(),
+        if (phone != null) 'phone': phone.trim(),
+        if (password != null && password.isNotEmpty) 'password': password,
+        if (status != null && status.isNotEmpty) 'status': status,
+        if (designation != null && designation.trim().isNotEmpty) 'designation': designation.trim(),
+      };
+      if (body.isEmpty) {
+        _lastActionError = 'Nothing to update.';
+        return false;
+      }
+      await _api.production.updateUser(userId, body);
+      await fetchAdminUsersList();
+      return true;
+    } on DioException catch (e) {
+      _lastActionError = ApiClient.errorMessage(e) ?? 'Could not update user.';
+      return false;
+    } catch (e) {
+      _lastActionError = e.toString();
+      return false;
+    }
+  }
+
+  Future<bool> deleteExecutive(String userId) async {
+    _lastActionError = null;
+    try {
+      final ok = await _api.production.deleteUser(userId);
+      if (!ok) {
+        _lastActionError = 'Delete failed on server.';
+        return false;
+      }
+      await fetchAdminUsersList();
+      return true;
+    } on DioException catch (e) {
+      _lastActionError = ApiClient.errorMessage(e) ?? 'Could not delete user.';
+      return false;
+    } catch (e) {
+      _lastActionError = e.toString();
+      return false;
+    }
+  }
+
+  /// Creates a team member. [role] is `executive`, `manager`, or `admin`.
+  Future<bool> createExecutive(
+    String name,
+    String email,
+    String password, {
+    String role = 'executive',
+  }) async {
     _isLoading = true;
+    _lastActionError = null;
     notifyListeners();
 
-    try {
-      final response = await _apiClient.post(ApiEndpoints.users, data: {
-        'name': name,
-        'email': email,
-        'password': password,
-        'role': 'executive',
-      });
-
-      if (response.statusCode == 200 || response.statusCode == 201) {
-        _isLoading = false;
-        await fetchAdminUsersList();
-        await fetchAdminStats();
-        return true;
-      }
-    } catch (e) {
-      print('Create executive failed on server: $e. Simulating local insert for demo.');
+    final normalizedRole = role.trim().toLowerCase();
+    final allowed = {'executive', 'manager', 'admin'};
+    if (!allowed.contains(normalizedRole)) {
+      _lastActionError = 'Role must be admin, manager, or executive.';
+      _isLoading = false;
+      notifyListeners();
+      return false;
+    }
+    if (!isValidLoginEmail(email)) {
+      _lastActionError = 'Invalid email address. Check for typos (e.g. .com.com).';
+      _isLoading = false;
+      notifyListeners();
+      return false;
     }
 
-    // High fidelity simulator insert
-    _adminUsersList.insert(0, {
-      'id': 'exec-${_uuid.v4()}',
-      'name': name,
-      'email': email,
-      'role': 'executive',
-      'status': 'active',
-      'created_at': DateTime.now().toUtc().toIso8601String(),
-      'designation': 'Field Sales Executive',
-    });
+    // Managers may only create executives; org admins can create all three.
+    final myRole = (_role ?? '').toLowerCase();
+    if (myRole == 'manager' || myRole == 'sales_manager' || myRole == 'regional_manager') {
+      if (normalizedRole != 'executive') {
+        _lastActionError = 'Managers can only create executive accounts.';
+        _isLoading = false;
+        notifyListeners();
+        return false;
+      }
+    }
+
+    try {
+      await _api.production.createUser({
+        'name': name.trim(),
+        'email': email.trim(),
+        'password': password,
+        'role': normalizedRole,
+      });
+      _isLoading = false;
+      await fetchAdminUsersList();
+      await fetchAdminStats();
+      notifyListeners();
+      return true;
+    } on DioException catch (e) {
+      final msg = ApiClient.errorMessage(e) ?? 'Could not create user.';
+      if ((e.response?.statusCode == 403) || msg.toLowerCase().contains('permission')) {
+        _lastActionError =
+            'Your role cannot create users on the server (needs admin). '
+            'Super admin must be allowed by the API, or use an organisation admin account.';
+      } else {
+        _lastActionError = msg;
+      }
+      print('Create user failed: $_lastActionError');
+    } catch (e) {
+      _lastActionError = e.toString();
+      print('Create user failed: $e');
+    }
 
     _isLoading = false;
-    await fetchAdminStats();
-    return true;
+    notifyListeners();
+    return false;
+  }
+
+  /// Returns null on success (sets [pendingMessage]), or an error string.
+  Future<String?> registerOrganisation({
+    required String orgName,
+    required String orgSlug,
+    required String ownerName,
+    required String ownerEmail,
+    required String ownerPassword,
+    String? orgEmail,
+    String? orgPhone,
+    String? orgAddress,
+    String? ownerPhone,
+  }) async {
+    try {
+      final slug = orgSlug.trim().toLowerCase();
+      await _api.production.registerOrganisation({
+        'org_name': orgName.trim(),
+        'org_slug': slug,
+        'owner_name': ownerName.trim(),
+        'owner_email': ownerEmail.trim(),
+        'owner_password': ownerPassword,
+        if (orgEmail != null && orgEmail.trim().isNotEmpty) 'org_email': orgEmail.trim(),
+        if (orgPhone != null && orgPhone.trim().isNotEmpty) 'org_phone': orgPhone.trim(),
+        if (orgAddress != null && orgAddress.trim().isNotEmpty) 'org_address': orgAddress.trim(),
+        if (ownerPhone != null && ownerPhone.trim().isNotEmpty) 'owner_phone': ownerPhone.trim(),
+      });
+
+      // Keep full registration payload locally so super-admin can view slug + credentials.
+      await OrganisationRegistry.upsert({
+        'name': orgName.trim(),
+        'slug': slug,
+        'email': orgEmail?.trim(),
+        'phone': orgPhone?.trim(),
+        'address': orgAddress?.trim(),
+        'owner_name': ownerName.trim(),
+        'owner_email': ownerEmail.trim(),
+        'owner_password': ownerPassword,
+        'owner_phone': ownerPhone?.trim(),
+        'status': 'pending',
+        'created_at': DateTime.now().toUtc().toIso8601String(),
+      });
+
+      return null;
+    } on DioException catch (e) {
+      return ApiClient.errorMessage(e) ?? 'Could not submit organisation request.';
+    } catch (e) {
+      return e.toString();
+    }
+  }
+
+  List<Map<String, dynamic>> _pendingOrgs = [];
+  List<Map<String, dynamic>> get pendingOrganisations => _pendingOrgs;
+
+  List<Map<String, dynamic>> _managedOrganisations = [];
+  List<Map<String, dynamic>> get managedOrganisations => _managedOrganisations;
+
+  Future<void> fetchPendingOrganisations() async {
+    try {
+      final pending = await _api.production.pendingOrganisations();
+      final enriched = <Map<String, dynamic>>[];
+      for (final org in pending) {
+        final slug = (org['slug'] ?? org['org_slug'] ?? '').toString();
+        final local = slug.isNotEmpty ? await OrganisationRegistry.findBySlug(slug) : null;
+        // Prefer non-null local registration details over sparse API pending payload.
+        final merged = <String, dynamic>{
+          ...org,
+          if (local != null) ...local,
+          'id': org['id'] ?? local?['id'],
+          'slug': slug.isNotEmpty ? slug : (local?['slug'] ?? ''),
+          'name': org['name'] ?? local?['name'] ?? 'Organisation',
+          'email': _firstNonEmpty([org['email'], local?['email'], local?['org_email']]),
+          'phone': _firstNonEmpty([org['phone'], local?['phone'], local?['org_phone']]),
+          'address': _firstNonEmpty([org['address'], local?['address'], local?['org_address']]),
+          'owner_name': _firstNonEmpty([org['owner_name'], local?['owner_name']]),
+          'owner_email': _firstNonEmpty([org['owner_email'], local?['owner_email']]),
+          'owner_password': _firstNonEmpty([org['owner_password'], local?['owner_password']]),
+          'owner_phone': _firstNonEmpty([org['owner_phone'], local?['owner_phone']]),
+          'status': org['status'] ?? local?['status'] ?? 'pending',
+        };
+        enriched.add(merged);
+        await OrganisationRegistry.upsert(merged);
+      }
+      _pendingOrgs = enriched;
+      await fetchManagedOrganisations();
+      notifyListeners();
+    } catch (e) {
+      print('Fetch pending orgs failed: $e');
+      _pendingOrgs = [];
+      notifyListeners();
+    }
+  }
+
+  Future<void> fetchManagedOrganisations() async {
+    await OrganisationRegistry.ensureKnownOrganisations();
+    final all = await OrganisationRegistry.loadAll();
+    all.sort((a, b) {
+      final aa = (a['updated_at'] ?? a['created_at'] ?? '').toString();
+      final bb = (b['updated_at'] ?? b['created_at'] ?? '').toString();
+      return bb.compareTo(aa);
+    });
+    _managedOrganisations = all;
+    notifyListeners();
+  }
+
+  Future<bool> approveOrganisation(String orgId) async {
+    _lastApproveSubscriptionSummary = null;
+    _lastActionError = null;
+    try {
+      final result = await _api.production.approveOrganisation(orgId);
+      if (result == null) {
+        _lastActionError = 'Approve failed. Try again or check server logs.';
+        return false;
+      }
+      final orgPayload = result['org'] is Map
+          ? Map<String, dynamic>.from(result['org'] as Map)
+          : (result['id'] != null ? result : <String, dynamic>{});
+
+      final fromPending = _pendingOrgs.cast<Map<String, dynamic>?>().firstWhere(
+            (o) => o?['id']?.toString() == orgId,
+            orElse: () => null,
+          );
+      final local = fromPending ?? await OrganisationRegistry.findById(orgId);
+      final trialEnds = orgPayload['trial_ends_at']?.toString();
+      final graceEnds = orgPayload['grace_period_ends_at']?.toString();
+      final subStatus = orgPayload['subscription_status']?.toString() ?? 'trialing';
+
+      await OrganisationRegistry.upsert({
+        ...?local,
+        ...orgPayload,
+        'id': orgId,
+        'status': 'active',
+        'subscription_status': subStatus,
+        if (trialEnds != null) 'trial_ends_at': trialEnds,
+        if (graceEnds != null) 'grace_period_ends_at': graceEnds,
+        'approved_at': DateTime.now().toUtc().toIso8601String(),
+      });
+
+      if (trialEnds != null || graceEnds != null) {
+        final trialLocal = DateTime.tryParse(trialEnds ?? '')?.toLocal();
+        final graceLocal = DateTime.tryParse(graceEnds ?? '')?.toLocal();
+        _lastApproveSubscriptionSummary =
+            'Approved with free trial'
+            '${trialLocal != null ? ' until ${trialLocal.day}/${trialLocal.month}/${trialLocal.year}' : ' (7 days)'}'
+            '${graceLocal != null ? '. Grace until ${graceLocal.day}/${graceLocal.month}/${graceLocal.year}' : ' + 3-day grace'}'
+            '. Access locks after grace until payment.';
+      } else {
+        _lastApproveSubscriptionSummary =
+            'Organisation approved. Server stamps 7-day trial + 3-day grace; access locks after 10 days until payment.';
+      }
+
+      await fetchPendingOrganisations();
+      await fetchManagedOrganisations();
+      return true;
+    } on DioException catch (e) {
+      if (ApiClient.isSubscriptionExpired(e)) {
+        _lastActionError = ApiClient.subscriptionExpiredUserMessage;
+      } else {
+        _lastActionError = ApiClient.errorMessage(e) ?? e.toString();
+      }
+      return false;
+    } catch (e) {
+      _lastActionError = e.toString();
+      return false;
+    }
+  }
+
+  Future<bool> rejectOrganisation(String orgId) async {
+    try {
+      final ok = await _api.production.rejectOrganisation(orgId);
+      if (ok) {
+        final fromPending = _pendingOrgs.cast<Map<String, dynamic>?>().firstWhere(
+              (o) => o?['id']?.toString() == orgId,
+              orElse: () => null,
+            );
+        final local = fromPending ?? await OrganisationRegistry.findById(orgId);
+        await OrganisationRegistry.upsert({
+          ...?local,
+          'id': orgId,
+          'status': 'rejected',
+          'rejected_at': DateTime.now().toUtc().toIso8601String(),
+        });
+        await fetchPendingOrganisations();
+        await fetchManagedOrganisations();
+      }
+      if (!ok) _lastActionError = 'Reject failed. Try again or check server logs.';
+      return ok;
+    } catch (e) {
+      _lastActionError = e.toString();
+      return false;
+    }
+  }
+
+  /// Load subscription fields for the signed-in org admin (GET /admin/org).
+  Future<void> fetchOrgSubscription() async {
+    if ((_role ?? '').toLowerCase() == 'super_admin') return; // platform SA has no single tenant org
+    try {
+      final org = await _api.production.getAdminOrg();
+      if (org != null) {
+        _orgSubscription = org;
+        if (_adminStats != null) {
+          _adminStats = {
+            ..._adminStats!,
+            'org': {
+              ..._mapFrom(_adminStats!['org']),
+              ...org,
+            },
+          };
+        }
+        notifyListeners();
+      }
+    } on DioException catch (e) {
+      if (ApiClient.isSubscriptionExpired(e)) {
+        await consumeSubscriptionLockMessage();
+        _loginError = ApiClient.subscriptionExpiredUserMessage;
+        _isAuthenticated = false;
+        notifyListeners();
+      }
+      print('fetchOrgSubscription failed: $e');
+    } catch (e) {
+      print('fetchOrgSubscription failed: $e');
+    }
+  }
+
+  /// Super-admin: extend / reset an organisation subscription window.
+  Future<bool> updateOrganisationSubscription({
+    required String orgId,
+    String subscriptionStatus = 'trialing',
+    DateTime? trialEndsAt,
+    DateTime? gracePeriodEndsAt,
+  }) async {
+    _lastActionError = null;
+    try {
+      final now = DateTime.now().toUtc();
+      final trial = trialEndsAt ?? now.add(const Duration(days: 7));
+      final grace = gracePeriodEndsAt ?? now.add(const Duration(days: 10));
+      final result = await _api.production.updateOrgSubscription(orgId, {
+        'subscription_status': subscriptionStatus,
+        'trial_ends_at': trial.toIso8601String(),
+        'grace_period_ends_at': grace.toIso8601String(),
+      });
+      if (result == null) {
+        _lastActionError = 'Could not update subscription.';
+        return false;
+      }
+      final org = result['org'] is Map
+          ? Map<String, dynamic>.from(result['org'] as Map)
+          : result;
+      await OrganisationRegistry.upsert({
+        'id': orgId,
+        ...org,
+        'status': org['status'] ?? 'active',
+      });
+      await fetchManagedOrganisations();
+      return true;
+    } on DioException catch (e) {
+      _lastActionError = ApiClient.errorMessage(e) ?? e.toString();
+      return false;
+    } catch (e) {
+      _lastActionError = e.toString();
+      return false;
+    }
+  }
+
+  Future<void> updateManagedOrganisationDetails(String orgIdOrSlug, Map<String, dynamic> fields) async {
+    final existing = await OrganisationRegistry.findById(orgIdOrSlug) ??
+        await OrganisationRegistry.findBySlug(orgIdOrSlug);
+    await OrganisationRegistry.upsert({
+      ...?existing,
+      ...fields,
+      if (existing?['id'] != null) 'id': existing!['id'],
+      if (existing?['slug'] != null) 'slug': existing!['slug'],
+    });
+    await fetchManagedOrganisations();
+    await fetchPendingOrganisations();
   }
 
   Future<void> fetchAdminLiveVisitsList() async {
     try {
-      final response = await _apiClient.get(ApiEndpoints.adminLiveVisits);
-      if (response.statusCode == 200) {
-        final rawList = (response.data['visits'] as List<dynamic>?) ??
-            (response.data['data'] as List<dynamic>?) ??
-            [];
-        _adminLiveVisitsList = rawList.map((v) {
-          final visit = Map<String, dynamic>.from(v as Map);
-          final selfie = visit['selfieUrl']?.toString() ?? '';
-          final absoluteSelfie = selfie.isEmpty
-              ? null
-              : (selfie.startsWith('http') ? selfie : '${ApiEndpoints.baseUrl}$selfie');
+      final visits = await _api.production.listVisits();
+      Map<String, Map<String, dynamic>> usersById = {};
+      Map<String, Map<String, dynamic>> outletsById = {};
+      // Order totals live on /orders — merge by visit_id for admin Logs.
+      final orderTotalByVisitId = <String, double>{};
+      try {
+        final orders = await _api.production.listOrders();
+        for (final o in orders) {
+          final vid = (o['visit_id'] ?? o['visitId'] ?? '').toString();
+          if (vid.isEmpty) continue;
+          final amount = double.tryParse(
+                (o['total_amount'] ?? o['totalAmount'] ?? o['amount'] ?? o['sales_value'] ?? 0)
+                    .toString(),
+              ) ??
+              0.0;
+          orderTotalByVisitId[vid] = (orderTotalByVisitId[vid] ?? 0) + amount;
+        }
+      } catch (_) {}
+      try {
+        final users = await _api.production.adminUsers();
+        for (final u in users) {
+          final id = u['id']?.toString();
+          if (id != null) usersById[id] = u;
+        }
+      } catch (_) {}
+      try {
+        final outlets = await _api.production.outlets();
+        for (final o in outlets) {
+          final id = o['id']?.toString();
+          if (id != null) outletsById[id] = o;
+        }
+      } catch (_) {}
+
+      // Keep a user directory for Team even if a prior /users call failed mid-session.
+      if (usersById.isNotEmpty && _adminUsersList.isEmpty) {
+        _adminUsersList = usersById.values.map((u) {
           return {
-            'id': visit['id'],
-            'executiveName': visit['executiveName'] ?? visit['executiveEmail'] ?? 'Executive',
-            'executiveEmail': visit['executiveEmail'] ?? '',
-            'outletName': visit['outletName'] ?? 'Outlet',
-            'outletAddress': visit['outletAddress'] ?? '',
-            'checkInTime': visit['checkInTime'],
-            'checkOutTime': visit['checkOutTime'],
-            'salesValue': double.tryParse(visit['salesValue']?.toString() ?? '0') ?? 0.0,
-            'remarks': visit['remarks'] ?? '',
-            'gpsLat': visit['gpsLat'],
-            'gpsLng': visit['gpsLng'],
-            'address': visit['outletAddress'],
-            'selfieUrl': absoluteSelfie,
-            'status': visit['status'],
+            'id': u['id'],
+            'name': u['name'] ?? u['email'] ?? 'User',
+            'email': u['email'] ?? '',
+            'role': u['role'] ?? '',
+            'status': (u['status'] ?? 'active').toString().toLowerCase() == 'active' ? 'active' : 'inactive',
+            'designation': u['role'] ?? 'Field Agent',
+            'phone': u['phone'],
+            'raw': u,
           };
         }).toList();
-        notifyListeners();
-        return;
       }
+
+      _adminLiveVisitsList = visits.map((visit) {
+        final userId = visit['user_id']?.toString() ??
+            visit['userId']?.toString() ??
+            visit['executiveId']?.toString() ??
+            '';
+        final visitId = visit['id']?.toString() ?? '';
+        final outletId = visit['outlet_id']?.toString() ?? visit['outletId']?.toString() ?? '';
+        final user = usersById[userId] ?? {};
+        final outlet = outletsById[outletId] ?? {};
+        if (_isHiddenFromOrgActivity(
+          role: user['role']?.toString() ?? visit['executiveRole']?.toString(),
+          name: user['name']?.toString() ?? visit['executiveName']?.toString(),
+          email: user['email']?.toString() ?? visit['executiveEmail']?.toString(),
+        )) {
+          return null;
+        }
+        final notes = (visit['notes'] ?? visit['remarks'] ?? '').toString();
+        final outletName = (outlet['name'] ?? visit['outletName'] ?? 'Retail Outlet').toString();
+        final isDailyLogin = notes.contains(dailyLoginNotesPrefix) ||
+            outletName.toLowerCase() == dailyLoginOutletName.toLowerCase();
+
+        var selfie = visit['selfie_url']?.toString() ??
+            visit['selfieUrl']?.toString() ??
+            visit['login_selfie_url']?.toString() ??
+            visit['loginSelfieUrl']?.toString() ??
+            visit['check_in_selfie_url']?.toString() ??
+            visit['checkInSelfieUrl']?.toString() ??
+            visit['photo_url']?.toString() ??
+            visit['photoUrl']?.toString() ??
+            '';
+        // Nested media objects from some API versions
+        if (selfie.isEmpty) {
+          final media = visit['selfie_media'] ?? visit['selfieMedia'] ?? visit['media'];
+          if (media is Map) {
+            selfie = media['url']?.toString() ??
+                media['path']?.toString() ??
+                media['file_url']?.toString() ??
+                '';
+          }
+        }
+        if (selfie.isEmpty && notes.contains('selfie=')) {
+          // Prefer URL / data URI after selfie= until next pipe (or end).
+          final match = RegExp(r'selfie=([^|]*)').firstMatch(notes);
+          selfie = match?.group(1)?.trim() ?? '';
+        }
+        final absoluteSelfie = _absoluteSelfieUrl(selfie);
+        final name = (user['name'] ??
+                visit['executiveName'] ??
+                user['email'] ??
+                visit['executiveEmail'] ??
+                'Executive')
+            .toString();
+        String? placeFromNotes;
+        if (notes.contains('place=')) {
+          placeFromNotes = RegExp(r'place=([^|]*)').firstMatch(notes)?.group(1)?.trim();
+        }
+
+        double salesValue = 0.0;
+        if (!isDailyLogin) {
+          salesValue = double.tryParse(
+                (visit['salesValue'] ?? visit['sales_value'] ?? visit['order_total'] ?? '0').toString(),
+              ) ??
+              0.0;
+          if (salesValue <= 0 && visitId.isNotEmpty && orderTotalByVisitId.containsKey(visitId)) {
+            salesValue = orderTotalByVisitId[visitId]!;
+          }
+          if (salesValue <= 0 && notes.contains('ORDER_TOTAL=')) {
+            final m = RegExp(r'ORDER_TOTAL=([0-9]+(?:\.[0-9]+)?)').firstMatch(notes);
+            salesValue = double.tryParse(m?.group(1) ?? '') ?? 0.0;
+          }
+        }
+
+        // Hide internal ORDER_TOTAL tag from client remarks UI.
+        var displayRemarks = notes;
+        if (displayRemarks.contains('ORDER_TOTAL=')) {
+          displayRemarks = displayRemarks
+              .split('|')
+              .where((p) => !p.trim().startsWith('ORDER_TOTAL='))
+              .join('|')
+              .trim();
+        }
+
+        return {
+          'id': visit['id'],
+          'executiveName': name,
+          'executiveEmail': user['email'] ?? visit['executiveEmail'] ?? '',
+          'executiveRole': user['role'] ?? visit['executiveRole'] ?? '',
+          'outletName': isDailyLogin ? 'Daily field login' : outletName,
+          'outletAddress': isDailyLogin
+              ? (placeFromNotes?.isNotEmpty == true
+                  ? placeFromNotes
+                  : (outlet['address'] ?? visit['outletAddress'] ?? 'Login location'))
+              : (outlet['address'] ?? visit['outletAddress'] ?? ''),
+          'checkInTime': visit['check_in_at'] ?? visit['checkInTime'] ?? visit['started_at'],
+          'checkOutTime': visit['check_out_at'] ?? visit['checkOutTime'] ?? visit['ended_at'],
+          'salesValue': salesValue,
+          'remarks': isDailyLogin
+              ? 'Daily blink selfie + GPS at field start'
+              : displayRemarks,
+          'gpsLat': visit['check_in_lat'] ??
+              visit['start_latitude'] ??
+              visit['gpsLat'] ??
+              visit['latitude'],
+          'gpsLng': visit['check_in_lng'] ??
+              visit['start_longitude'] ??
+              visit['gpsLng'] ??
+              visit['longitude'],
+          'address': isDailyLogin
+              ? (placeFromNotes ?? outlet['address'] ?? visit['outletAddress'] ?? 'Daily field login')
+              : (outlet['address'] ?? visit['outletAddress'] ?? visit['address']),
+          'selfieUrl': absoluteSelfie,
+          'status': visit['status'],
+          'isDailyLogin': isDailyLogin,
+        };
+      }).whereType<Map<String, dynamic>>().toList();
+      notifyListeners();
+      return;
     } catch (e) {
       print('Fetch admin live visits (API) failed: $e. Falling back to local visits.');
     }
@@ -2597,9 +5678,7 @@ class AppProvider extends ChangeNotifier {
         }
 
         final selfie = v['selfie_url']?.toString() ?? '';
-        final absoluteSelfie = selfie.isEmpty
-            ? null
-            : (selfie.startsWith('http') ? selfie : '${ApiEndpoints.baseUrl}$selfie');
+        final absoluteSelfie = _absoluteSelfieUrl(selfie);
 
         return {
           'id': v['id'],
@@ -2627,22 +5706,195 @@ class AppProvider extends ChangeNotifier {
   }
 
   Future<void> fetchAdminLiveGpsList() async {
-    try {
-      final localGps = await DatabaseHelper.instance.queryAll('offline_gps_pings');
-      _adminLiveGpsList = localGps.reversed.take(100).map((ping) {
-        return {
-          'id': ping['id'],
-          'latitude': ping['latitude'],
-          'longitude': ping['longitude'],
-          'address': ping['address'],
-          'timestamp': ping['timestamp'],
-          'startPoint': ping['tracking_start_point'],
-          'userId': _userId,
-        };
-      }).toList();
-      notifyListeners();
-    } catch (e) {
-      print('Fetch admin live GPS list failed: $e');
+    final merged = <Map<String, dynamic>>[];
+    final seen = <String>{};
+
+    void addPing(Map<String, dynamic> ping) {
+      final lat = ping['latitude'];
+      final lng = ping['longitude'];
+      final ts = ping['timestamp']?.toString() ?? '';
+      final key = '${ping['executiveEmail'] ?? ping['userId']}|$lat|$lng|$ts';
+      if (!seen.add(key)) return;
+      merged.add(ping);
     }
+
+    // 1) Primary: visit check-in / check-out GPS from production (all executives in org).
+    try {
+      final visits = await _api.production.listVisits();
+      Map<String, Map<String, dynamic>> usersById = {};
+      try {
+        final users = await _api.production.adminUsers();
+        for (final u in users) {
+          final id = u['id']?.toString();
+          if (id != null) usersById[id] = u;
+        }
+      } catch (_) {}
+
+      for (final visit in visits) {
+        final userId = visit['user_id']?.toString() ?? '';
+        final user = usersById[userId] ?? {};
+        if (_isHiddenFromOrgActivity(
+          role: user['role']?.toString(),
+          name: user['name']?.toString(),
+          email: user['email']?.toString(),
+        )) {
+          continue;
+        }
+        final name = (user['name'] ?? user['email'] ?? 'Executive').toString();
+        final email = (user['email'] ?? '').toString();
+        final notes = (visit['notes'] ?? visit['remarks'] ?? '').toString();
+        final isDailyLogin = notes.contains(dailyLoginNotesPrefix);
+
+        final inLat = visit['check_in_lat'] ?? visit['gpsLat'] ?? visit['start_latitude'] ?? visit['latitude'];
+        final inLng = visit['check_in_lng'] ?? visit['gpsLng'] ?? visit['start_longitude'] ?? visit['longitude'];
+        final inTs = visit['check_in_at'] ?? visit['checkInTime'] ?? visit['created_at'];
+        if (inLat != null && inLng != null) {
+          addPing({
+            'id': 'visit-in-${visit['id']}',
+            'latitude': inLat,
+            'longitude': inLng,
+            'address': isDailyLogin
+                ? (visit['check_in_address'] ?? 'Daily field login')
+                : (visit['check_in_address'] ?? visit['address'] ?? 'Visit check-in'),
+            'timestamp': inTs,
+            'startPoint': isDailyLogin ? 'DAILY_LOGIN' : 'VISIT_CHECKIN',
+            'userId': userId,
+            'executiveName': name,
+            'executiveEmail': email,
+            'source': isDailyLogin ? 'daily_login' : 'visit',
+          });
+        }
+
+        if (isDailyLogin) continue; // daily login is a single point-in-time event
+
+        final outLat = visit['check_out_lat'] ?? visit['end_latitude'];
+        final outLng = visit['check_out_lng'] ?? visit['end_longitude'];
+        final outTs = visit['check_out_at'] ?? visit['checkOutTime'];
+        if (outLat != null && outLng != null) {
+          addPing({
+            'id': 'visit-out-${visit['id']}',
+            'latitude': outLat,
+            'longitude': outLng,
+            'address': visit['check_out_address'] ?? 'Visit check-out',
+            'timestamp': outTs,
+            'startPoint': 'VISIT_CHECKOUT',
+            'userId': userId,
+            'executiveName': name,
+            'executiveEmail': email,
+            'source': 'visit',
+          });
+        }
+      }
+    } catch (e) {
+      print('Admin GPS from visits failed: $e');
+    }
+
+    // 2) Optional: GET /gps/log if server supports listing (many deploys only have POST).
+    try {
+      final response = await _apiClient.get(ApiEndpoints.gpsLog);
+      if (response.statusCode == 200) {
+        final raw = _responseList(response, 'logs');
+        final alt = raw.isEmpty ? _responseList(response, 'pings') : raw;
+        final body = response.data;
+        final fromBody = body is List
+            ? body
+            : (body is Map && body['data'] is List ? body['data'] as List : const <dynamic>[]);
+        final list = alt.isNotEmpty ? alt : fromBody;
+        for (final row in list) {
+          if (row is! Map) continue;
+          final map = Map<String, dynamic>.from(row);
+          final role = map['user_role']?.toString() ?? map['role']?.toString();
+          final name = map['user_name']?.toString() ?? map['executiveName']?.toString() ?? map['name']?.toString();
+          final email = map['user_email']?.toString() ?? map['email']?.toString();
+          if (_isHiddenFromOrgActivity(role: role, name: name, email: email)) continue;
+          addPing({
+            'id': map['id'] ?? _uuid.v4(),
+            'latitude': map['latitude'] ?? map['lat'],
+            'longitude': map['longitude'] ?? map['lng'] ?? map['lon'],
+            'address': map['address'],
+            'timestamp': map['timestamp'] ?? map['created_at'] ?? map['logged_at'],
+            'startPoint': map['tracking_start_point'] ?? map['startPoint'] ?? 'TRACKING',
+            'userId': map['user_id'] ?? map['userId'],
+            'executiveName': name ?? 'Executive',
+            'executiveEmail': email ?? '',
+            'source': 'gps_api',
+          });
+        }
+      }
+    } catch (_) {
+      // POST-only GPS endpoint — ignore.
+    }
+
+    // 3) Local device pings — only when an executive is using this device.
+    // Never attribute local DB pings to admin/super_admin (caused Lakshmiraj showing in Logs).
+    if (_isExecutiveRole()) {
+      try {
+        final localGps = await DatabaseHelper.instance.queryAll('offline_gps_pings');
+        for (final ping in localGps.reversed.take(50)) {
+          addPing({
+            'id': ping['id'],
+            'latitude': ping['latitude'],
+            'longitude': ping['longitude'],
+            'address': ping['address'],
+            'timestamp': ping['timestamp'],
+            'startPoint': ping['tracking_start_point'] ?? 'HOME',
+            'userId': _userId,
+            'executiveName': _email?.split('@').first ?? 'You',
+            'executiveEmail': _email ?? '',
+            'source': 'local',
+          });
+        }
+      } catch (e) {
+        print('Fetch local admin GPS failed: $e');
+      }
+    }
+
+    merged.sort((a, b) {
+      final ta = DateTime.tryParse(a['timestamp']?.toString() ?? '') ?? DateTime.fromMillisecondsSinceEpoch(0);
+      final tb = DateTime.tryParse(b['timestamp']?.toString() ?? '') ?? DateTime.fromMillisecondsSinceEpoch(0);
+      return tb.compareTo(ta);
+    });
+
+    // Final privacy filter: never show super-admin / Lakshmiraj activity.
+    final filtered = merged.where((ping) {
+      return !_isHiddenFromOrgActivity(
+        name: ping['executiveName']?.toString(),
+        email: ping['executiveEmail']?.toString(),
+      );
+    }).toList();
+
+    // Resolve human-readable place names for pings that only have coordinates.
+    final limited = filtered.take(200).toList();
+    var geocodeBudget = 30;
+    for (final ping in limited) {
+      final rawAddress = ping['address']?.toString();
+      if (!_isUnresolvedAddress(rawAddress)) continue;
+      final lat = double.tryParse(ping['latitude']?.toString() ?? '');
+      final lng = double.tryParse(ping['longitude']?.toString() ?? '');
+      if (lat == null || lng == null) {
+        ping['address'] = 'GPS ${ping['latitude']}, ${ping['longitude']}';
+        continue;
+      }
+      String? resolved;
+      if (geocodeBudget > 0) {
+        geocodeBudget--;
+        resolved = await _resolveAddressCached(lat, lng);
+      }
+      ping['address'] = resolved ?? 'GPS ${lat.toStringAsFixed(5)}, ${lng.toStringAsFixed(5)}';
+      // Backfill local DB when this ping came from the device.
+      if (ping['source'] == 'local' && ping['id'] != null && resolved != null) {
+        try {
+          await DatabaseHelper.instance.update(
+            'offline_gps_pings',
+            {'address': resolved},
+            where: 'id = ?',
+            whereArgs: [ping['id']],
+          );
+        } catch (_) {}
+      }
+    }
+
+    _adminLiveGpsList = limited;
+    notifyListeners();
   }
 }

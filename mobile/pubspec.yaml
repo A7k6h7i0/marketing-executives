@@ -1,5 +1,5 @@
 name: mobile
-description: "A new Flutter project."
+description: "Marketing Executives — field sales & marketing force app."
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -49,6 +49,9 @@ dependencies:
   flutter_map: ^8.3.0
   latlong2: ^0.9.1
   google_fonts: ^6.2.1
+  share_plus: ^12.0.2
+  camera: ^0.12.0+2
+  google_mlkit_face_detection: ^0.14.0
 
 dev_dependencies:
   flutter_test:
@@ -71,6 +74,9 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  assets:
+    - assets/branding/app_icon.png
 
   # To add assets to your application, add an assets section, like this:
   # assets:

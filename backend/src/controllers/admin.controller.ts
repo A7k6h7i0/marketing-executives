@@ -1,4 +1,5 @@
 import { Response } from "express";
+import bcrypt from "bcryptjs";
 import { prisma } from "../config/prisma";
 import { AuthenticatedRequest } from "../middlewares/auth";
 import { Role, AttendanceStatus, ResolutionStatus, LeadStatus, Grade } from "@prisma/client";
@@ -321,13 +322,26 @@ export const createUser = async (req: AuthenticatedRequest, res: Response): Prom
 
     const passwordHash = await bcrypt.hash(password, 10);
 
+    let resolvedRole: Role = Role.SALES_EXECUTIVE;
+    if (role) {
+      const normalized = String(role).toUpperCase().replace(/ /g, "_");
+      if (normalized === "EXECUTIVE" || normalized === "SALES_EXECUTIVE") {
+        resolvedRole = Role.SALES_EXECUTIVE;
+      } else if (Object.values(Role).includes(normalized as Role)) {
+        resolvedRole = normalized as Role;
+      } else {
+        res.status(400).json({ error: `Invalid role. Use SALES_EXECUTIVE, SALES_MANAGER, etc.` });
+        return;
+      }
+    }
+
     const user = await prisma.user.create({
       data: {
         email,
         passwordHash,
         phone,
         name,
-        role: role || Role.SALES_EXECUTIVE,
+        role: resolvedRole,
         region,
       },
       select: {
@@ -347,8 +361,6 @@ export const createUser = async (req: AuthenticatedRequest, res: Response): Prom
     res.status(500).json({ error: error.message });
   }
 };
-
-import bcrypt from "bcryptjs";
 
 export const updateUser = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const userId = req.params.userId as string;
@@ -439,6 +451,64 @@ export const getLiveVisits = async (req: AuthenticatedRequest, res: Response): P
         remarks: v.remarks,
         status: v.checkoutTime ? "COMPLETED" : "IN_VISIT",
       })),
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+async function ensureAppSettings() {
+  return prisma.appSetting.upsert({
+    where: { id: "default" },
+    create: {
+      id: "default",
+      selfieRequired: false,
+      minVisitDurationMinutes: 3,
+    },
+    update: {},
+  });
+}
+
+/** Field policy: selfie required Yes/No + auto-visit dwell minutes. */
+export const getAppSettings = async (_req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    const settings = await ensureAppSettings();
+    res.status(200).json({
+      selfieRequired: settings.selfieRequired,
+      minVisitDurationMinutes: settings.minVisitDurationMinutes,
+      updatedAt: settings.updatedAt,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+export const updateAppSettings = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  try {
+    await ensureAppSettings();
+    const { selfieRequired, minVisitDurationMinutes } = req.body;
+
+    const data: { selfieRequired?: boolean; minVisitDurationMinutes?: number } = {};
+    if (typeof selfieRequired === "boolean") data.selfieRequired = selfieRequired;
+    if (minVisitDurationMinutes !== undefined) {
+      const minutes = Number(minVisitDurationMinutes);
+      if (!Number.isFinite(minutes) || minutes < 1 || minutes > 120) {
+        res.status(400).json({ error: "minVisitDurationMinutes must be between 1 and 120." });
+        return;
+      }
+      data.minVisitDurationMinutes = Math.round(minutes);
+    }
+
+    const settings = await prisma.appSetting.update({
+      where: { id: "default" },
+      data,
+    });
+
+    res.status(200).json({
+      message: "Settings updated",
+      selfieRequired: settings.selfieRequired,
+      minVisitDurationMinutes: settings.minVisitDurationMinutes,
+      updatedAt: settings.updatedAt,
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message });

@@ -12,7 +12,6 @@ class BestieLogo extends StatelessWidget {
       width: size,
       height: size,
       decoration: BoxDecoration(
-        gradient: BestieTokens.gBrand,
         borderRadius: BorderRadius.circular(size * 0.25),
         boxShadow: [
           BoxShadow(
@@ -22,7 +21,20 @@ class BestieLogo extends StatelessWidget {
           ),
         ],
       ),
-      child: Icon(Icons.task_alt_rounded, color: Colors.white, size: size * 0.52),
+      clipBehavior: Clip.antiAlias,
+      child: Image.asset(
+        'assets/branding/app_icon.png',
+        width: size,
+        height: size,
+        fit: BoxFit.cover,
+        errorBuilder: (_, __, ___) => Container(
+          decoration: BoxDecoration(
+            gradient: BestieTokens.gBrand,
+            borderRadius: BorderRadius.circular(size * 0.25),
+          ),
+          child: Icon(Icons.campaign_rounded, color: Colors.white, size: size * 0.52),
+        ),
+      ),
     );
 
     if (!withWordmark) return mark;
@@ -39,16 +51,16 @@ class BestieLogo extends StatelessWidget {
               blendMode: BlendMode.srcIn,
               shaderCallback: (rect) => BestieTokens.gBrand.createShader(rect),
               child: Text(
-                'FieldForce',
+                'Marketing',
                 style: TextStyle(
-                  fontSize: size * 0.42,
+                  fontSize: size * 0.38,
                   fontWeight: FontWeight.w800,
                   letterSpacing: -0.4,
                 ),
               ),
             ),
             Text(
-              'Marketing',
+              'Executives',
               style: TextStyle(
                 fontSize: size * 0.22,
                 fontWeight: FontWeight.w600,

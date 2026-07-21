@@ -95,14 +95,29 @@ export const getProducts = async (req: AuthenticatedRequest, res: Response): Pro
 
 export const checkIn = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const userId = req.user?.id;
-  const { outletId, outlet, gpsLat, gpsLng, selfieUrl, managerOverrideFlag } = req.body;
+  const { outletId, outlet, gpsLat, gpsLng, selfieUrl, managerOverrideFlag, autoComplete } = req.body;
 
-  if (!userId || gpsLat === undefined || gpsLng === undefined || !selfieUrl) {
-    res.status(400).json({ error: "gpsLat, gpsLng, and selfieUrl are required." });
+  if (!userId || gpsLat === undefined || gpsLng === undefined) {
+    res.status(400).json({ error: "gpsLat and gpsLng are required." });
     return;
   }
 
   try {
+    const settings = await prisma.appSetting.upsert({
+      where: { id: "default" },
+      create: { id: "default", selfieRequired: false, minVisitDurationMinutes: 3 },
+      update: {},
+    });
+
+    const resolvedSelfie =
+      selfieUrl && String(selfieUrl).trim().length > 0
+        ? String(selfieUrl)
+        : "auto-detected";
+
+    if (settings.selfieRequired && resolvedSelfie === "auto-detected" && !autoComplete) {
+      res.status(400).json({ error: "Selfie is required for check-in (admin policy)." });
+      return;
+    }
     const openVisit = await prisma.visit.findFirst({
       where: { userId, checkoutTime: null },
     });
@@ -161,14 +176,41 @@ export const checkIn = async (req: AuthenticatedRequest, res: Response): Promise
         outletId: resolvedOutletId,
         gpsLat: Number(gpsLat),
         gpsLng: Number(gpsLng),
-        selfieUrl,
+        selfieUrl: resolvedSelfie,
         checkinTime: new Date(),
+        checkoutTime: autoComplete ? new Date() : null,
+        remarks: autoComplete
+          ? `Auto-completed after dwell at outlet (selfie policy: ${settings.selfieRequired ? "required" : "off"}).`
+          : undefined,
         syncStatus: SyncStatus.SYNCED,
       },
     });
 
+    if (autoComplete) {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const plan = await prisma.dailyPlan.findFirst({
+        where: { userId, planDate: today },
+      });
+      if (plan) {
+        const todayEnd = new Date(today);
+        todayEnd.setHours(23, 59, 59, 999);
+        const completedVisitsCount = await prisma.visit.count({
+          where: {
+            userId,
+            checkinTime: { gte: today, lte: todayEnd },
+            checkoutTime: { not: null },
+          },
+        });
+        await prisma.dailyPlan.update({
+          where: { id: plan.id },
+          data: { completedVisits: completedVisitsCount },
+        });
+      }
+    }
+
     res.status(201).json({
-      message: "Check-in successful",
+      message: autoComplete ? "Visit auto-completed" : "Check-in successful",
       visit,
       distanceFromOutletMeters: Number(distanceMeters.toFixed(1)),
     });

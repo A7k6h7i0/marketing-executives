@@ -19,7 +19,7 @@ class DatabaseHelper {
 
     return await openDatabase(
       path,
-      version: 5,
+      version: 7,
       onCreate: _createDB,
       onUpgrade: _upgradeDB,
     );
@@ -80,6 +80,7 @@ class DatabaseHelper {
         business_category TEXT NOT NULL,
         contact_phone TEXT,
         contact_email TEXT,
+        address TEXT,
         gps_lat REAL NOT NULL,
         gps_lng REAL NOT NULL,
         lead_status TEXT NOT NULL,
@@ -108,6 +109,18 @@ class DatabaseHelper {
         duration_seconds INTEGER NOT NULL DEFAULT 0,
         break_date TEXT NOT NULL,
         synced INTEGER NOT NULL DEFAULT 0
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE offline_executive_products (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        size TEXT,
+        sku TEXT NOT NULL,
+        unit_price REAL NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
       )
     ''');
   }
@@ -142,6 +155,24 @@ class DatabaseHelper {
           duration_seconds INTEGER NOT NULL DEFAULT 0,
           break_date TEXT NOT NULL,
           synced INTEGER NOT NULL DEFAULT 0
+        )
+      ''');
+    }
+    if (oldVersion < 6) {
+      try {
+        await db.execute('ALTER TABLE offline_leads ADD COLUMN address TEXT');
+      } catch (_) {}
+    }
+    if (oldVersion < 7) {
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS offline_executive_products (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          size TEXT,
+          sku TEXT NOT NULL,
+          unit_price REAL NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
         )
       ''');
     }

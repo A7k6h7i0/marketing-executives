@@ -194,11 +194,16 @@ export const convertLeadToOutlet = async (req: AuthenticatedRequest, res: Respon
       return;
     }
 
+    const addressFromBody =
+      typeof req.body?.address === "string" && req.body.address.trim()
+        ? req.body.address.trim()
+        : `${lead.businessName} (${lead.businessCategory})`;
+
     // 1. Create a new outlet record
     const outlet = await prisma.outlet.create({
       data: {
         name: lead.businessName,
-        address: "Address derived from Smart Lead", // Executive can update this in the mobile form later
+        address: addressFromBody,
         contactPhone: lead.contactPhone,
         contactEmail: lead.contactEmail,
         gpsLat: lead.gpsLat,
