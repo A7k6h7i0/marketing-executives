@@ -708,21 +708,32 @@ void showOrderCatalogScreen(BuildContext context, AppProvider provider) {
                                   spacing: 8,
                                   runSpacing: 6,
                                   children: AppProvider.quickRemarkKeywords.map((remark) {
-                                    return ActionChip(
+                                    final parts = remarksController.text
+                                        .split(';')
+                                        .map((e) => e.trim())
+                                        .where((e) => e.isNotEmpty)
+                                        .toList();
+                                    final selected = parts.any(
+                                      (p) => p.toLowerCase() == remark.toLowerCase(),
+                                    );
+                                    return ChoiceChip(
                                       label: Text(remark, style: const TextStyle(fontSize: 11)),
-                                      onPressed: () {
-                                        final parts = remarksController.text
-                                            .split(';')
-                                            .map((e) => e.trim())
-                                            .where((e) => e.isNotEmpty)
+                                      selected: selected,
+                                      onSelected: (_) {
+                                        // Keep free-text notes; allow only one quick remark at a time.
+                                        final custom = parts
+                                            .where(
+                                              (p) => !AppProvider.quickRemarkKeywords.any(
+                                                (k) => k.toLowerCase() == p.toLowerCase(),
+                                              ),
+                                            )
                                             .toList();
-                                        final already = parts.any((p) => p.toLowerCase() == remark.toLowerCase());
-                                        if (already) {
-                                          parts.removeWhere((p) => p.toLowerCase() == remark.toLowerCase());
+                                        if (selected) {
+                                          // Tap again to clear the quick remark.
+                                          remarksController.text = custom.join('; ');
                                         } else {
-                                          parts.add(remark);
+                                          remarksController.text = [...custom, remark].join('; ');
                                         }
-                                        remarksController.text = parts.join('; ');
                                         remarksController.selection = TextSelection.collapsed(
                                           offset: remarksController.text.length,
                                         );
@@ -4896,10 +4907,33 @@ class _AdminTeamTabState extends State<AdminTeamTab> {
                       ],
                     ),
                     const SizedBox(height: 6),
-                    if (canEdit || canDelete)
+                    if (canEdit || canDelete || appProvider.isPlatformSuperAdmin)
                       Row(
                         mainAxisAlignment: MainAxisAlignment.end,
                         children: [
+                          if (appProvider.isPlatformSuperAdmin &&
+                              (user['id']?.toString().isNotEmpty ?? false) &&
+                              (user['role']?.toString().toLowerCase() == 'executive' ||
+                                  user['role']?.toString().toLowerCase() == 'sales_executive'))
+                            TextButton.icon(
+                              onPressed: () async {
+                                final id = user['id'].toString();
+                                final ok = await appProvider.forceLogoutUser(id);
+                                if (!context.mounted) return;
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                    content: Text(
+                                      ok
+                                          ? 'Device unlocked. ${user['name'] ?? 'User'} can sign in again.'
+                                          : (appProvider.lastActionError ??
+                                              'Could not unlock device (super_admin required on server).'),
+                                    ),
+                                  ),
+                                );
+                              },
+                              icon: const Icon(Icons.lock_open, size: 18),
+                              label: const Text('Unlock device'),
+                            ),
                           if (canEdit)
                             TextButton.icon(
                               onPressed: () => _editUser(appProvider, user),
@@ -5148,19 +5182,23 @@ class AdminLiveActivitiesTab extends StatelessWidget {
 
   Widget _buildVisitsSubTab(BuildContext context, List<dynamic> visits) {
     if (visits.isEmpty) {
-      return const Center(
+      final role = (Provider.of<AppProvider>(context, listen: false).role ?? '').toLowerCase();
+      final isSuper = role == 'super_admin' || role == 'superadmin';
+      return Center(
         child: Padding(
-          padding: EdgeInsets.all(24.0),
+          padding: const EdgeInsets.all(24.0),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(Icons.store_outlined, size: 64, color: BestieTokens.cTextMuted),
-              SizedBox(height: 12),
-              Text('No live visits logged yet.', style: TextStyle(fontWeight: FontWeight.bold, color: BestieTokens.cTextMuted)),
+              const Icon(Icons.store_outlined, size: 64, color: BestieTokens.cTextMuted),
+              const SizedBox(height: 12),
+              const Text('No live visits logged yet.', style: TextStyle(fontWeight: FontWeight.bold, color: BestieTokens.cTextMuted)),
               Text(
-                'Executives’ daily login selfie and outlet check-ins appear here. Pull to refresh after they start their day.',
+                isSuper
+                    ? 'Platform super_admin cannot read org Logs on the server (403). Sign in as organisation admin (e.g. Rajesh) to see Farhan/Sunitha attendance and visits.'
+                    : 'Executives’ attendance logins and outlet check-ins appear here. Pull to refresh after they start their day.',
                 textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 12, color: BestieTokens.cTextMuted),
+                style: const TextStyle(fontSize: 12, color: BestieTokens.cTextMuted),
               ),
             ],
           ),
@@ -5186,10 +5224,13 @@ class AdminLiveActivitiesTab extends StatelessWidget {
   Widget _buildVisitLogCard(BuildContext context, dynamic visit) {
     final checkedOut = visit['checkOutTime'] != null;
     final isDailyLogin = visit['isDailyLogin'] == true;
+    final isGpsLive = visit['source']?.toString() == 'gps_live';
     final name = visit['executiveName']?.toString() ?? 'Executive';
     final email = visit['executiveEmail']?.toString() ?? '';
     final initial = name.isNotEmpty ? name.substring(0, 1).toUpperCase() : '?';
-    final statusLabel = isDailyLogin
+    final statusLabel = isGpsLive
+        ? 'GPS LIVE'
+        : isDailyLogin
         ? 'DAILY LOGIN'
         : (checkedOut ? 'COMPLETED' : 'IN VISIT');
     final hasSelfie = visit['selfieUrl'] != null &&
@@ -5253,7 +5294,11 @@ class AdminLiveActivitiesTab extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Icon(
-                isDailyLogin ? Icons.login_rounded : Icons.storefront_outlined,
+                isGpsLive
+                    ? Icons.my_location
+                    : isDailyLogin
+                        ? Icons.login_rounded
+                        : Icons.storefront_outlined,
                 size: 18,
                 color: BestieTokens.cBrand,
               ),
@@ -5263,7 +5308,11 @@ class AdminLiveActivitiesTab extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      isDailyLogin ? 'Daily field login' : outletName,
+                      isGpsLive
+                          ? 'Live GPS update'
+                          : isDailyLogin
+                              ? 'Daily field login'
+                              : outletName,
                       style: const TextStyle(
                         fontWeight: BestieTokens.fwBold,
                         fontSize: 14,
@@ -5272,7 +5321,9 @@ class AdminLiveActivitiesTab extends StatelessWidget {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      isDailyLogin
+                      isGpsLive
+                          ? address
+                          : isDailyLogin
                           ? address
                           : [
                               if (phone.isNotEmpty) phone,
@@ -5297,7 +5348,11 @@ class AdminLiveActivitiesTab extends StatelessWidget {
           // Selfie block
           if (hasSelfie) ...[
             Text(
-              isDailyLogin ? 'DAILY LOGIN SELFIE' : 'CHECK-IN SELFIE',
+              isGpsLive
+                  ? 'LATEST CHECK-IN SELFIE'
+                  : isDailyLogin
+                      ? 'DAILY LOGIN SELFIE'
+                      : 'CHECK-IN SELFIE',
               style: const TextStyle(
                 fontSize: 10,
                 fontWeight: BestieTokens.fwBold,
@@ -5310,6 +5365,8 @@ class AdminLiveActivitiesTab extends StatelessWidget {
               borderRadius: BorderRadius.circular(BestieTokens.rMd),
               child: _buildVisitSelfieImage(context, visit['selfieUrl'].toString()),
             ),
+          ] else if (isGpsLive) ...[
+            _noSelfieInfoBanner('Live GPS ping from production'),
           ] else if (isDailyLogin) ...[
             const Text(
               'DAILY LOGIN SELFIE',
@@ -5346,7 +5403,11 @@ class AdminLiveActivitiesTab extends StatelessWidget {
                   TextSpan(
                     children: [
                       TextSpan(
-                        text: isDailyLogin ? 'LOGIN AT  ' : 'CHECK-IN AT  ',
+                        text: isGpsLive
+                            ? 'GPS AT  '
+                            : isDailyLogin
+                                ? 'LOGIN AT  '
+                                : 'CHECK-IN AT  ',
                         style: const TextStyle(
                           fontSize: 11,
                           fontWeight: BestieTokens.fwBold,
@@ -5414,7 +5475,9 @@ class AdminLiveActivitiesTab extends StatelessWidget {
 
           const SizedBox(height: 10),
           Text(
-            isDailyLogin
+            isGpsLive
+                ? 'Activity: Production GPS live ping'
+                : isDailyLogin
                 ? 'Activity: Daily field login (blink selfie + location)'
                 : 'Client Remarks: $remarks',
             style: const TextStyle(
@@ -5570,6 +5633,7 @@ class AdminLiveActivitiesTab extends StatelessWidget {
               ? ping['address'].toString()
               : 'Resolving location…';
           final source = ping['startPoint']?.toString() ?? ping['source']?.toString() ?? 'TRACKING';
+          final deviceId = ping['deviceId']?.toString() ?? '';
           return _AdminPanelCard(
             padding: const EdgeInsets.fromLTRB(14, 14, 14, 12),
             onTap: () async {
@@ -5601,38 +5665,27 @@ class AdminLiveActivitiesTab extends StatelessWidget {
                         ],
                       ),
                     ),
-                    Text(
-                      _formatTime(ping['timestamp']?.toString()),
-                      style: const TextStyle(fontSize: 11, fontWeight: BestieTokens.fwBold, color: BestieTokens.cTextMuted),
-                    ),
+                    _outlinedStatusBadge(source.toUpperCase()),
                   ],
                 ),
-                const SizedBox(height: 12),
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFF3F6FC),
-                    borderRadius: BorderRadius.circular(BestieTokens.rMd),
+                const SizedBox(height: 10),
+                Text(address, style: const TextStyle(fontSize: 13, color: BestieTokens.cText)),
+                const SizedBox(height: 6),
+                Text(
+                  'GPS: $lat, $lng',
+                  style: const TextStyle(fontSize: 12, color: BestieTokens.cTextMuted),
+                ),
+                if (deviceId.isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    'Device: ${deviceId.length > 18 ? '${deviceId.substring(0, 18)}…' : deviceId}',
+                    style: const TextStyle(fontSize: 11, color: BestieTokens.cTextMuted),
                   ),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Icon(Icons.gps_fixed, size: 18, color: BestieTokens.cBrand),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(address, style: const TextStyle(fontSize: 12, fontWeight: BestieTokens.fwBold)),
-                            const SizedBox(height: 2),
-                            Text('GPS: $lat, $lng', style: const TextStyle(fontSize: 11, color: BestieTokens.cTextMuted)),
-                            Text('Source: $source', style: const TextStyle(fontSize: 11, color: BestieTokens.cTextMuted)),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
+                ],
+                const SizedBox(height: 4),
+                Text(
+                  _formatTime(ping['timestamp']?.toString()),
+                  style: const TextStyle(fontSize: 11, color: BestieTokens.cTextMuted),
                 ),
               ],
             ),

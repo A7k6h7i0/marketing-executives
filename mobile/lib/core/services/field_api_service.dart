@@ -45,10 +45,23 @@ class FieldApiService {
     return _ok(data);
   }
 
-  Future<Response> logout(String deviceId) async {
-    await _prod.logout();
+  Future<Response> logout(String deviceId, {String? refreshToken}) async {
+    await _prod.logout(deviceId: deviceId, refreshToken: refreshToken);
     return _ok({});
   }
+
+  Future<Map<String, dynamic>?> checkOutAttendance({
+    required double latitude,
+    required double longitude,
+  }) {
+    return _prod.attendanceCheckOut(latitude: latitude, longitude: longitude);
+  }
+
+  Future<List<Map<String, dynamic>>> attendanceList({int page = 1, int perPage = 100}) {
+    return _prod.attendanceList(page: page, perPage: perPage);
+  }
+
+  Future<bool> adminForceLogout(String userId) => _prod.adminForceLogout(userId);
 
   // ── Attendance ────────────────────────────────────────────────────
   Future<Response> attendanceToday(String userId) async {
@@ -93,14 +106,31 @@ class FieldApiService {
     required String trackingStartPoint,
     String? timestamp,
     String? address,
+    String? deviceId,
+    double? accuracy,
+    String? offlineId,
   }) async {
     final ping = await _prod.gpsLog(
       latitude: latitude,
       longitude: longitude,
       timestamp: timestamp,
       address: address,
+      deviceId: deviceId,
+      trackingStartPoint: trackingStartPoint,
+      accuracy: accuracy,
+      offlineId: offlineId,
     );
     return _ok({'ping': ping});
+  }
+
+  Future<List<Map<String, dynamic>>> gpsLive() => _prod.gpsLive();
+
+  Future<List<Map<String, dynamic>>> gpsHistory({String? userId, int page = 1, int perPage = 100}) {
+    return _prod.gpsHistory(userId: userId, page: page, perPage: perPage);
+  }
+
+  Future<List<Map<String, dynamic>>> adminUserSessions(String userId) {
+    return _prod.adminUserSessions(userId);
   }
 
   Future<Response> gpsSummary(String userId, String date) async {
@@ -319,12 +349,15 @@ class FieldApiService {
   }
 
   Future<String> uploadSelfie(File file) async {
-    final url = await _prod.uploadSelfie(file);
+    final url = await _prod.uploadLoginSelfie(file) ?? await _prod.uploadSelfie(file);
     if (url == null || url.isEmpty) {
       throw Exception('Selfie upload not available on server yet');
     }
     return url;
   }
+
+  /// Upload blink/login selfie to production `/media/upload-login-selfie`.
+  Future<String?> uploadLoginSelfie(File file) => _prod.uploadLoginSelfie(file);
 
   // ── Outlets ───────────────────────────────────────────────────────
   Future<Response> ensureOutlet(Map<String, dynamic> outlet) async {

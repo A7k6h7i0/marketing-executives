@@ -35,6 +35,7 @@ class AppProvider extends ChangeNotifier {
   /// False until startup session restore / token check finishes. AuthGate waits on this.
   bool _sessionReady = false;
   String? _token;
+  String? _refreshToken;
   String? _userId;
   String? _email;
   String? _phone;
@@ -244,8 +245,9 @@ class AppProvider extends ChangeNotifier {
     }
 
     if (code == 'DEVICE_LOCKED' || apiLower.contains('already active on another device')) {
-      return 'This account is already active on another device. '
-          'Log out there first, or ask your admin to force-logout.';
+      return 'This account is still locked to another device session. '
+          'On that phone use Logout (not just close the app). '
+          'If the phone is lost, ask platform super_admin to Unlock device / force-logout.';
     }
 
     if (status == 402 ||
@@ -480,6 +482,9 @@ class AppProvider extends ChangeNotifier {
       (_role ?? '').toLowerCase() == 'super_admin' ||
       (_role ?? '').toLowerCase() == 'superadmin';
 
+  /// Public for admin UI (force-unlock stuck DEVICE_LOCKED accounts).
+  bool get isPlatformSuperAdmin => _isPlatformSuperAdmin;
+
   /// Platform owner org — never show trial banner or apply client lock.
   bool get _isAddPhoneBookOrg {
     final slug = (_orgSlug ??
@@ -646,6 +651,7 @@ class AppProvider extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     try {
       _token = prefs.getString('jwt_token');
+      _refreshToken = prefs.getString('refresh_token');
       _userId = prefs.getString('user_id');
       _email = prefs.getString('user_email');
       _phone = prefs.getString('user_phone');
@@ -742,6 +748,7 @@ class AppProvider extends ChangeNotifier {
 
   Future<void> _clearAuthPrefs(SharedPreferences prefs) async {
     await prefs.remove('jwt_token');
+    await prefs.remove('refresh_token');
     await prefs.remove('user_id');
     await prefs.remove('user_email');
     await prefs.remove('user_phone');
@@ -750,6 +757,7 @@ class AppProvider extends ChangeNotifier {
     await prefs.remove('user_org_slug');
     await prefs.remove('user_login_password');
     _token = null;
+    _refreshToken = null;
     _userId = null;
     _email = null;
     _phone = null;
@@ -936,6 +944,7 @@ class AppProvider extends ChangeNotifier {
         final user = _mapFrom(payload['user']);
 
         _token = payload['access_token']?.toString() ?? payload['token']?.toString();
+        _refreshToken = payload['refresh_token']?.toString() ?? payload['refreshToken']?.toString();
         _userId = user['id']?.toString();
         _email = user['email']?.toString();
         _phone = user['phone']?.toString();
@@ -951,6 +960,11 @@ class AppProvider extends ChangeNotifier {
         }
 
         await prefs.setString('jwt_token', _token!);
+        if (_refreshToken != null && _refreshToken!.isNotEmpty) {
+          await prefs.setString('refresh_token', _refreshToken!);
+        } else {
+          await prefs.remove('refresh_token');
+        }
         await prefs.setString('user_id', _userId!);
         if (_email != null) await prefs.setString('user_email', _email!);
         if (_phone != null) await prefs.setString('user_phone', _phone!);
@@ -984,9 +998,10 @@ class AppProvider extends ChangeNotifier {
           final access = await DeviceLocation.ensureAccess();
           if (access != LocationAccessResult.granted) {
             _loginError = 'Location permission is required for executive login. Allow Location and try again.';
-            _isAuthenticated = false;
-            _token = null;
-            await prefs.remove('jwt_token');
+            await _abortAuthenticatedSession(
+              deviceId: resolvedDeviceId,
+              reason: 'location_denied',
+            );
             _isLoading = false;
             notifyListeners();
             return false;
@@ -998,9 +1013,10 @@ class AppProvider extends ChangeNotifier {
           );
           if (pos == null) {
             _loginError = 'Could not read GPS. Turn on Location and try login again.';
-            _isAuthenticated = false;
-            _token = null;
-            await prefs.remove('jwt_token');
+            await _abortAuthenticatedSession(
+              deviceId: resolvedDeviceId,
+              reason: 'gps_unavailable',
+            );
             _isLoading = false;
             notifyListeners();
             return false;
@@ -1070,15 +1086,25 @@ class AppProvider extends ChangeNotifier {
 
     stopContinuousGpsTracking();
 
-    if (_attendanceStatus == 'LOGGED_IN' || _attendanceStatus == 'PRESENT') {
-      await checkOutAttendance(endDayOnly: true);
-    }
+    final prefs = await SharedPreferences.getInstance();
+    final resolvedDeviceId = deviceId.isNotEmpty
+        ? deviceId
+        : (prefs.getString('device_fingerprint') ?? await DeviceId.get());
+    final refresh = _refreshToken ?? prefs.getString('refresh_token');
 
+    // Close attendance + revoke device session BEFORE clearing local JWT.
+    _lastActionError = null;
+    await checkOutAttendance(endDayOnly: true);
     try {
-      final resolvedDeviceId = deviceId.isNotEmpty ? deviceId : await DeviceId.get();
-      await _api.logout(resolvedDeviceId);
+      await _api.logout(resolvedDeviceId, refreshToken: refresh);
+    } on DioException catch (e) {
+      _lastActionError = ApiClient.errorMessage(e) ??
+          'Production logout failed. The local session was cleared, but this device may still be locked on the server.';
+      print('Production logout failed: $_lastActionError');
     } catch (e) {
-      print('Logout API failed (might be offline): $e');
+      _lastActionError =
+          'Production logout failed. The local session was cleared, but this device may still be locked on the server.';
+      print('Production logout failed: $e');
     }
 
     // Clear local session regardless of API success (failsafe).
@@ -1090,7 +1116,6 @@ class AppProvider extends ChangeNotifier {
     final keepLastPath = TelecallerRecordingSetup.lastUploadedPath;
     final keepLastMs = TelecallerRecordingSetup.lastUploadedModifiedMs;
 
-    final prefs = await SharedPreferences.getInstance();
     // Preserve organisation registration vault across logout (super-admin needs history).
     final orgRegistry = prefs.getString(OrganisationRegistry.prefsKey);
     // Keep once-per-day field selfie so re-login same day does not re-ask.
@@ -1138,6 +1163,7 @@ class AppProvider extends ChangeNotifier {
 
     _isAuthenticated = false;
     _token = null;
+    _refreshToken = null;
     _userId = null;
     _email = null;
     _phone = null;
@@ -1334,11 +1360,25 @@ class AppProvider extends ChangeNotifier {
 
   Future<bool> checkOutAttendance({bool endDayOnly = false}) async {
     if (_attendanceStatus != 'LOGGED_IN' && _attendanceStatus != 'PRESENT') {
-      return false;
+      // Still try server check-out when ending day from logout (status may be stale).
+      if (!endDayOnly) return false;
     }
 
     if (_activeBreak != null) {
       await endBreakSession();
+    }
+
+    try {
+      double lat = 0;
+      double lng = 0;
+      final pos = await DeviceLocation.resolvePosition(timeLimit: const Duration(seconds: 4));
+      if (pos != null) {
+        lat = pos.latitude;
+        lng = pos.longitude;
+      }
+      await _api.checkOutAttendance(latitude: lat, longitude: lng);
+    } catch (e) {
+      print('Production attendance check-out: $e');
     }
 
     final now = DateTime.now().toUtc();
@@ -1354,6 +1394,202 @@ class AppProvider extends ChangeNotifier {
     await _persistLocalAttendance();
     notifyListeners();
     return true;
+  }
+
+  /// Login succeeded on server but client cannot continue (no GPS, etc.).
+  /// Must revoke the device session or the account stays DEVICE_LOCKED.
+  Future<void> _abortAuthenticatedSession({
+    required String deviceId,
+    required String reason,
+  }) async {
+    print('Aborting authenticated session ($reason) — revoking server device lock');
+    final prefs = await SharedPreferences.getInstance();
+    final refresh = _refreshToken ?? prefs.getString('refresh_token');
+    try {
+      await _api.checkOutAttendance(latitude: 0, longitude: 0);
+    } catch (_) {}
+    try {
+      await _api.logout(deviceId, refreshToken: refresh);
+    } catch (e) {
+      print('Abort logout failed: $e');
+    }
+    _isAuthenticated = false;
+    _token = null;
+    _refreshToken = null;
+    await prefs.remove('jwt_token');
+    await prefs.remove('refresh_token');
+    notifyListeners();
+  }
+
+  /// Super-admin: unlock a stuck DEVICE_LOCKED account so they can sign in again.
+  Future<bool> forceLogoutUser(String userId) async {
+    _lastActionError = null;
+    try {
+      final ok = await _api.adminForceLogout(userId);
+      if (ok) {
+        await fetchAdminUsersList();
+        await fetchAdminLiveVisitsList();
+      } else {
+        _lastActionError = 'Production force-logout failed. Check that this account has super_admin permission.';
+      }
+      return ok;
+    } on DioException catch (e) {
+      _lastActionError = ApiClient.errorMessage(e) ??
+          'Production force-logout failed. Check that this account has super_admin permission.';
+      print('forceLogoutUser failed: $_lastActionError');
+      return false;
+    } catch (e) {
+      _lastActionError = e.toString();
+      print('forceLogoutUser failed: $_lastActionError');
+      return false;
+    }
+  }
+
+  /// Login-screen emergency unlock for DEVICE_LOCKED users.
+  /// Uses a temporary production super-admin token, then clears it so the app
+  /// stays on the login screen.
+  Future<bool> emergencyForceLogoutWithSuperAdmin({
+    required String superAdminEmail,
+    required String superAdminPassword,
+    required String targetEmailOrUserId,
+    String? orgSlug,
+  }) async {
+    _lastActionError = null;
+    final target = targetEmailOrUserId.trim();
+    if (target.isEmpty) {
+      _lastActionError = 'Enter the locked user email or user id.';
+      return false;
+    }
+
+    _isLoading = true;
+    notifyListeners();
+
+    final prefs = await SharedPreferences.getInstance();
+    final previousToken = prefs.getString('jwt_token');
+    final previousRefresh = prefs.getString('refresh_token');
+    final previousUserId = prefs.getString('user_id');
+    final previousEmail = prefs.getString('user_email');
+    final previousPhone = prefs.getString('user_phone');
+    final previousRole = prefs.getString('user_role');
+    final previousRegion = prefs.getString('user_region');
+    final previousOrgSlug = prefs.getString('user_org_slug');
+    final previousPassword = prefs.getString('user_login_password');
+    String? tempDeviceId;
+    String? tempRefresh;
+
+    try {
+      final deviceId = 'super-admin-unlock-${DateTime.now().millisecondsSinceEpoch}';
+      tempDeviceId = deviceId;
+      final loginResponse = await _api.login(
+        password: superAdminPassword,
+        email: superAdminEmail.trim(),
+        deviceId: deviceId,
+        orgSlug: (orgSlug != null && orgSlug.trim().isNotEmpty) ? orgSlug.trim() : null,
+      );
+      final payload = _responseData(loginResponse);
+      final token = payload['access_token']?.toString() ?? payload['token']?.toString();
+      final refresh = payload['refresh_token']?.toString() ?? payload['refreshToken']?.toString();
+      if (token == null || token.isEmpty) {
+        _lastActionError = 'Super-admin login did not return a token.';
+        return false;
+      }
+
+      await prefs.setString('jwt_token', token);
+      if (refresh != null && refresh.isNotEmpty) {
+        tempRefresh = refresh;
+        await prefs.setString('refresh_token', refresh);
+      } else {
+        await prefs.remove('refresh_token');
+      }
+
+      var targetUserId = target;
+      final uuidLike = RegExp(
+        r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
+      ).hasMatch(target);
+      if (!uuidLike) {
+        final knownAddPhoneBookIds = <String, String>{
+          'lakshmiraj@addphonebook.com': '00000000-0000-4000-a000-000000000001',
+          'rajesh.kumar@addphonebook.com': '00000000-0000-4000-a000-000000000011',
+          'farhan@addphonebook.com': '00000000-0000-4000-a000-000000000014',
+        };
+        targetUserId = knownAddPhoneBookIds[target.toLowerCase()] ?? '';
+
+        if (targetUserId.isEmpty) {
+          try {
+            final users = await _api.production.adminUsers();
+            Map<String, dynamic>? match;
+            for (final user in users) {
+              final email = (user['email'] ?? '').toString().trim().toLowerCase();
+              final phone = (user['phone'] ?? '').toString().trim();
+              if (email == target.toLowerCase() || phone == target) {
+                match = user;
+                break;
+              }
+            }
+            targetUserId = match?['id']?.toString() ?? '';
+          } on DioException catch (e) {
+            final msg = ApiClient.errorMessage(e) ?? '';
+            if (e.response?.statusCode == 403 || msg.toLowerCase().contains('requires role')) {
+              _lastActionError =
+                  'Production blocked user lookup for super_admin. Paste the locked user id instead of email.';
+              return false;
+            }
+            rethrow;
+          }
+        }
+
+        if (targetUserId.isEmpty) {
+          _lastActionError =
+              'Could not find that user in production. Enter the exact user id instead of email.';
+          return false;
+        }
+      }
+
+      if (targetUserId.isEmpty) {
+        _lastActionError = 'Could not resolve locked user id.';
+        return false;
+      }
+
+      final ok = await _api.adminForceLogout(targetUserId);
+      if (!ok) {
+        _lastActionError = 'Production force-logout failed for this user.';
+        return false;
+      }
+      return true;
+    } on DioException catch (e) {
+      _lastActionError = ApiClient.errorMessage(e) ??
+          'Unlock failed. Check super-admin credentials and production permissions.';
+      return false;
+    } catch (e) {
+      _lastActionError = e.toString().replaceFirst('Exception: ', '');
+      return false;
+    } finally {
+      if (tempDeviceId != null) {
+        try {
+          await _api.logout(tempDeviceId!, refreshToken: tempRefresh);
+        } catch (_) {}
+      }
+      if (previousToken != null && previousToken.isNotEmpty) {
+        await prefs.setString('jwt_token', previousToken);
+      } else {
+        await prefs.remove('jwt_token');
+      }
+      if (previousRefresh != null && previousRefresh.isNotEmpty) {
+        await prefs.setString('refresh_token', previousRefresh);
+      } else {
+        await prefs.remove('refresh_token');
+      }
+      if (previousUserId != null) await prefs.setString('user_id', previousUserId);
+      if (previousEmail != null) await prefs.setString('user_email', previousEmail);
+      if (previousPhone != null) await prefs.setString('user_phone', previousPhone);
+      if (previousRole != null) await prefs.setString('user_role', previousRole);
+      if (previousRegion != null) await prefs.setString('user_region', previousRegion);
+      if (previousOrgSlug != null) await prefs.setString('user_org_slug', previousOrgSlug);
+      if (previousPassword != null) await prefs.setString('user_login_password', previousPassword);
+
+      _isLoading = false;
+      notifyListeners();
+    }
   }
 
   Future<bool> checkInAttendance(double lat, double lng, {double accuracy = 8.5}) async {
@@ -2800,12 +3036,15 @@ class AppProvider extends ChangeNotifier {
     notifyListeners();
 
     try {
+      final deviceId = await DeviceId.get();
       final response = await _api.gpsPing(
         latitude: latitude,
         longitude: longitude,
         trackingStartPoint: startPoint,
         timestamp: timestamp,
         address: resolvedAddress,
+        deviceId: deviceId,
+        offlineId: localPingId,
       );
       if (response.statusCode == 201 || response.statusCode == 200) {
         await DatabaseHelper.instance.update(
@@ -2822,7 +3061,7 @@ class AppProvider extends ChangeNotifier {
         }
       }
     } catch (e) {
-      print('GPS ping API failed. Queued locally for offline sync.');
+      print('Production GPS ping failed. Queued locally for offline sync: $e');
     }
   }
 
@@ -3239,6 +3478,22 @@ class AppProvider extends ChangeNotifier {
     } catch (e) {
       _lastActionError = e.toString();
       return false;
+    }
+  }
+
+  /// Upload blink/login selfie to production `/api/v1/media/upload-login-selfie`.
+  /// Returns an absolute HTTPS URL when successful.
+  Future<String?> uploadLoginSelfieFile(File file) async {
+    try {
+      final url = await _api.uploadLoginSelfie(file);
+      if (url == null || url.trim().isEmpty) return null;
+      final trimmed = url.trim();
+      if (trimmed.startsWith('http')) return trimmed;
+      if (trimmed.startsWith('/')) return '${ApiEndpoints.baseUrl}$trimmed';
+      return '${ApiEndpoints.baseUrl}/$trimmed';
+    } catch (e) {
+      print('uploadLoginSelfieFile failed: $e');
+      return null;
     }
   }
 
@@ -4766,11 +5021,15 @@ class AppProvider extends ChangeNotifier {
     final offlinePings = await DatabaseHelper.instance.queryAll('offline_gps_pings', where: 'synced = 0');
     for (final ping in offlinePings) {
       try {
+        final deviceId = await DeviceId.get();
         final response = await _api.gpsPing(
           latitude: double.parse(ping['latitude'].toString()),
           longitude: double.parse(ping['longitude'].toString()),
           trackingStartPoint: ping['tracking_start_point']?.toString() ?? _odometerStartPoint,
           timestamp: ping['timestamp']?.toString(),
+          address: ping['address']?.toString(),
+          deviceId: deviceId,
+          offlineId: ping['id']?.toString(),
         );
         if (response.statusCode == 201 || response.statusCode == 200) {
           await DatabaseHelper.instance.update(
@@ -5011,8 +5270,22 @@ class AppProvider extends ChangeNotifier {
 
       final raw = _responseList(response, 'users');
       // Attendance / online is not on /users.status (that is account active/inactive).
-      // Derive live presence from open visits + today's visit activity.
+      // Derive live presence from org attendance + open visits.
       Map<String, Map<String, dynamic>> visitByUser = {};
+      Map<String, Map<String, dynamic>> attendanceByUser = {};
+      try {
+        final attendance = await _api.attendanceList(page: 1, perPage: 100);
+        for (final row in attendance) {
+          final userId = (row['user_id'] ?? row['userId'] ?? '').toString();
+          if (userId.isEmpty) continue;
+          final existing = attendanceByUser[userId];
+          final checkIn = (row['check_in_at'] ?? row['checkInAt'] ?? '').toString();
+          final existingIn = (existing?['check_in_at'] ?? '').toString();
+          if (existing == null || checkIn.compareTo(existingIn) > 0) {
+            attendanceByUser[userId] = Map<String, dynamic>.from(row);
+          }
+        }
+      } catch (_) {}
       try {
         final visits = await _api.production.listVisits();
         for (final visit in visits) {
@@ -5035,20 +5308,28 @@ class AppProvider extends ChangeNotifier {
         final id = u['id']?.toString() ?? '';
         final accountStatus = (u['status'] ?? 'active').toString().toLowerCase();
         final visit = visitByUser[id];
-        final checkInAt = visit?['check_in_at']?.toString() ??
+        final attendance = attendanceByUser[id];
+        final checkInAt = attendance?['check_in_at']?.toString() ??
+            visit?['check_in_at']?.toString() ??
             u['check_in_at']?.toString() ??
             u['checkInAt']?.toString();
-        final checkOutAt = visit?['check_out_at']?.toString() ??
+        final checkOutAt = attendance?['check_out_at']?.toString() ??
+            visit?['check_out_at']?.toString() ??
             u['check_out_at']?.toString() ??
             u['checkOutAt']?.toString();
         final visitStatus = (visit?['status'] ?? '').toString().toLowerCase();
+        final attendanceOpen = attendance != null &&
+            (attendance['check_out_at'] == null ||
+                (attendance['check_out_at']?.toString().isEmpty ?? true));
         final hasOpenVisit = visit != null &&
             checkInAt != null &&
             checkInAt.isNotEmpty &&
             (checkOutAt == null || checkOutAt.isEmpty) &&
             visitStatus != 'completed';
         final checkedInToday = checkInAt != null && _isSameLocalDay(checkInAt, DateTime.now());
-        var isOnline = hasOpenVisit || (checkedInToday && (checkOutAt == null || checkOutAt.isEmpty));
+        var isOnline = attendanceOpen ||
+            hasOpenVisit ||
+            (checkedInToday && (checkOutAt == null || checkOutAt.isEmpty));
         // Logged-in manager/admin on this device counts as online (they don't do field visits).
         if (!isOnline && id.isNotEmpty && id == _userId) {
           isOnline = true;
@@ -5494,22 +5775,117 @@ class AppProvider extends ChangeNotifier {
 
   Future<void> fetchAdminLiveVisitsList() async {
     try {
-      final visits = await _api.production.listVisits();
       Map<String, Map<String, dynamic>> usersById = {};
       Map<String, Map<String, dynamic>> outletsById = {};
-      // Order totals live on /orders — merge by visit_id for admin Logs.
       final orderTotalByVisitId = <String, double>{};
+      final latestSelfieByActor = <String, String>{};
+      final latestSalesByActor = <String, double>{};
+      final latestActivityTimeByActor = <String, DateTime>{};
+
+      List<String> actorKeys({String? userId, String? email}) {
+        return [
+          if (userId != null && userId.trim().isNotEmpty) 'id:${userId.trim()}',
+          if (email != null && email.trim().isNotEmpty) 'email:${email.trim().toLowerCase()}',
+        ];
+      }
+
+      List<String> visitIdKeys(Map<String, dynamic> row) {
+        final keys = <String>{};
+        void add(dynamic value) {
+          final text = value?.toString().trim() ?? '';
+          if (text.isNotEmpty && text != 'null') keys.add(text);
+        }
+
+        add(row['visit_id']);
+        add(row['visitId']);
+        add(row['visitID']);
+        add(row['field_visit_id']);
+        add(row['fieldVisitId']);
+        final visit = row['visit'];
+        if (visit is Map) {
+          add(visit['id']);
+          add(visit['visit_id']);
+          add(visit['visitId']);
+        }
+        return keys.toList();
+      }
+
+      double parseMoney(Map<String, dynamic> row) {
+        double fromValue(dynamic value) =>
+            double.tryParse((value ?? '').toString().replaceAll(',', '').trim()) ?? 0.0;
+        var amount = fromValue(row['total_amount'] ??
+            row['totalAmount'] ??
+            row['order_total'] ??
+            row['orderTotal'] ??
+            row['amount'] ??
+            row['sales_value'] ??
+            row['salesValue'] ??
+            row['grand_total'] ??
+            row['grandTotal']);
+        if (amount > 0) return amount;
+
+        final items = row['items'] ?? row['products'] ?? row['order_items'] ?? row['orderItems'];
+        if (items is List) {
+          for (final item in items) {
+            if (item is! Map) continue;
+            final qty = fromValue(item['quantity'] ?? item['qty'] ?? 1);
+            final price = fromValue(item['price'] ?? item['unitPrice'] ?? item['unit_price'] ?? item['rate']);
+            amount += qty * price;
+          }
+        }
+        return amount;
+      }
+
+      void rememberActorDetails({
+        required Iterable<String> keys,
+        String? selfieUrl,
+        double? salesValue,
+        dynamic when,
+      }) {
+        final parsedTime = DateTime.tryParse(when?.toString() ?? '') ??
+            DateTime.fromMillisecondsSinceEpoch(0);
+        for (final key in keys) {
+          if ((selfieUrl ?? '').trim().isNotEmpty) {
+            final previous = latestActivityTimeByActor[key];
+            if (previous == null || parsedTime.isAfter(previous)) {
+              latestSelfieByActor[key] = selfieUrl!.trim();
+              latestActivityTimeByActor[key] = parsedTime;
+            }
+          }
+          if ((salesValue ?? 0) > 0) {
+            latestSalesByActor[key] = salesValue!;
+          }
+        }
+      }
+
       try {
         final orders = await _api.production.listOrders();
         for (final o in orders) {
-          final vid = (o['visit_id'] ?? o['visitId'] ?? '').toString();
-          if (vid.isEmpty) continue;
-          final amount = double.tryParse(
-                (o['total_amount'] ?? o['totalAmount'] ?? o['amount'] ?? o['sales_value'] ?? 0)
-                    .toString(),
-              ) ??
-              0.0;
-          orderTotalByVisitId[vid] = (orderTotalByVisitId[vid] ?? 0) + amount;
+          final amount = parseMoney(o);
+          for (final vid in visitIdKeys(o)) {
+            orderTotalByVisitId[vid] = (orderTotalByVisitId[vid] ?? 0) + amount;
+          }
+          final orderUser = o['user'] ?? o['executive'] ?? o['employee'];
+          final orderUserMap = orderUser is Map ? orderUser : const <String, dynamic>{};
+          rememberActorDetails(
+            keys: actorKeys(
+              userId: (o['user_id'] ??
+                      o['userId'] ??
+                      o['executive_id'] ??
+                      o['executiveId'] ??
+                      orderUserMap['id'])
+                  ?.toString(),
+              email: (o['email'] ??
+                      o['user_email'] ??
+                      o['userEmail'] ??
+                      o['executive_email'] ??
+                      o['executiveEmail'] ??
+                      orderUserMap['email'])
+                  ?.toString(),
+            ),
+            salesValue: amount,
+            when: o['created_at'] ?? o['createdAt'] ?? o['ordered_at'] ?? o['orderedAt'],
+          );
         }
       } catch (_) {}
       try {
@@ -5527,7 +5903,6 @@ class AppProvider extends ChangeNotifier {
         }
       } catch (_) {}
 
-      // Keep a user directory for Team even if a prior /users call failed mid-session.
       if (usersById.isNotEmpty && _adminUsersList.isEmpty) {
         _adminUsersList = usersById.values.map((u) {
           return {
@@ -5543,7 +5918,121 @@ class AppProvider extends ChangeNotifier {
         }).toList();
       }
 
-      _adminLiveVisitsList = visits.map((visit) {
+      final merged = <Map<String, dynamic>>[];
+      final seenKeys = <String>{};
+      final attendanceDailyKeys = <String>{};
+
+      void addLog(Map<String, dynamic> row) {
+        final key = row['id']?.toString() ??
+            '${row['executiveEmail']}|${row['checkInTime']}|${row['outletName']}';
+        if (!seenKeys.add(key)) return;
+        merged.add(row);
+      }
+
+      String localDayKey(dynamic value) {
+        final raw = value?.toString() ?? '';
+        final parsed = DateTime.tryParse(raw);
+        if (parsed == null) return raw.length >= 10 ? raw.substring(0, 10) : raw;
+        return parsed.toLocal().toIso8601String().substring(0, 10);
+      }
+
+      // 1) Org attendance = authoritative daily login / logout times on the server.
+      try {
+        final attendance = await _api.attendanceList(page: 1, perPage: 100);
+        for (final row in attendance) {
+          final nestedUser = row['user'] is Map
+              ? Map<String, dynamic>.from(row['user'] as Map)
+              : row['executive'] is Map
+                  ? Map<String, dynamic>.from(row['executive'] as Map)
+                  : row['employee'] is Map
+                      ? Map<String, dynamic>.from(row['employee'] as Map)
+                      : <String, dynamic>{};
+          final userId = (row['user_id'] ??
+                  row['userId'] ??
+                  row['executive_id'] ??
+                  row['executiveId'] ??
+                  nestedUser['id'] ??
+                  '')
+              .toString();
+          final user = {
+            ...nestedUser,
+            ...?usersById[userId],
+          };
+          final checkInTime = row['check_in_at'] ??
+              row['checkInAt'] ??
+              row['login_at'] ??
+              row['loginAt'] ??
+              row['login_time'] ??
+              row['loginTime'] ??
+              row['created_at'] ??
+              row['createdAt'];
+          final checkOutTime = row['check_out_at'] ??
+              row['checkOutAt'] ??
+              row['logout_at'] ??
+              row['logoutAt'] ??
+              row['logout_time'] ??
+              row['logoutTime'];
+          if (_isHiddenFromOrgActivity(
+            role: user['role']?.toString() ?? row['role']?.toString(),
+            name: user['name']?.toString() ?? row['name']?.toString(),
+            email: user['email']?.toString() ?? row['email']?.toString(),
+          )) {
+            continue;
+          }
+          final name = (user['name'] ??
+                  row['executive_name'] ??
+                  row['executiveName'] ??
+                  user['email'] ??
+                  row['email'] ??
+                  'Executive')
+              .toString();
+          final email = (user['email'] ?? row['email'] ?? row['executive_email'] ?? row['executiveEmail'] ?? '')
+              .toString();
+          final selfie = _absoluteSelfieUrl(
+            (row['login_selfie_url'] ?? row['loginSelfieUrl'] ?? row['selfie_url'] ?? '').toString(),
+          );
+          if ((userId.isNotEmpty || email.isNotEmpty) && checkInTime != null) {
+            attendanceDailyKeys.add('${userId.isNotEmpty ? userId : email}|${localDayKey(checkInTime)}');
+          }
+          rememberActorDetails(
+            keys: actorKeys(userId: userId, email: email),
+            selfieUrl: selfie,
+            when: checkInTime,
+          );
+          addLog({
+            'id': 'att-${row['id'] ?? userId}-${checkInTime ?? DateTime.now().toUtc().toIso8601String()}',
+            'userId': userId,
+            'executiveName': name,
+            'executiveEmail': email,
+            'executiveRole': user['role'] ?? row['role'] ?? 'executive',
+            'outletName': 'Daily field login',
+            'outletAddress': row['notes'] ?? 'Attendance check-in',
+            'checkInTime': checkInTime,
+            'checkOutTime': checkOutTime,
+            'salesValue': 0.0,
+            'remarks': 'Attendance login (GPS + device session)',
+            'gpsLat': row['check_in_lat'] ?? row['checkInLat'] ?? row['latitude'],
+            'gpsLng': row['check_in_lng'] ?? row['checkInLng'] ?? row['longitude'],
+            'address': row['check_in_address'] ?? row['address'] ?? 'Attendance login',
+            'selfieUrl': selfie,
+            'status': row['status'] ?? 'checked_in',
+            'isDailyLogin': true,
+            'source': 'attendance',
+          });
+        }
+      } catch (e) {
+        print('Admin attendance feed failed: $e');
+      }
+
+      // 2) Outlet visits + synthetic daily-login visits.
+      List<Map<String, dynamic>> visits = const [];
+      try {
+        visits = await _api.production.listVisits();
+      } catch (e) {
+        print('Admin visits feed failed: $e');
+      }
+
+      for (final visit in visits) {
         final userId = visit['user_id']?.toString() ??
             visit['userId']?.toString() ??
             visit['executiveId']?.toString() ??
@@ -5557,7 +6046,7 @@ class AppProvider extends ChangeNotifier {
           name: user['name']?.toString() ?? visit['executiveName']?.toString(),
           email: user['email']?.toString() ?? visit['executiveEmail']?.toString(),
         )) {
-          return null;
+          continue;
         }
         final notes = (visit['notes'] ?? visit['remarks'] ?? '').toString();
         final outletName = (outlet['name'] ?? visit['outletName'] ?? 'Retail Outlet').toString();
@@ -5573,7 +6062,6 @@ class AppProvider extends ChangeNotifier {
             visit['photo_url']?.toString() ??
             visit['photoUrl']?.toString() ??
             '';
-        // Nested media objects from some API versions
         if (selfie.isEmpty) {
           final media = visit['selfie_media'] ?? visit['selfieMedia'] ?? visit['media'];
           if (media is Map) {
@@ -5584,7 +6072,6 @@ class AppProvider extends ChangeNotifier {
           }
         }
         if (selfie.isEmpty && notes.contains('selfie=')) {
-          // Prefer URL / data URI after selfie= until next pipe (or end).
           final match = RegExp(r'selfie=([^|]*)').firstMatch(notes);
           selfie = match?.group(1)?.trim() ?? '';
         }
@@ -5599,23 +6086,41 @@ class AppProvider extends ChangeNotifier {
         if (notes.contains('place=')) {
           placeFromNotes = RegExp(r'place=([^|]*)').firstMatch(notes)?.group(1)?.trim();
         }
-
-        double salesValue = 0.0;
-        if (!isDailyLogin) {
-          salesValue = double.tryParse(
-                (visit['salesValue'] ?? visit['sales_value'] ?? visit['order_total'] ?? '0').toString(),
-              ) ??
-              0.0;
-          if (salesValue <= 0 && visitId.isNotEmpty && orderTotalByVisitId.containsKey(visitId)) {
-            salesValue = orderTotalByVisitId[visitId]!;
-          }
-          if (salesValue <= 0 && notes.contains('ORDER_TOTAL=')) {
-            final m = RegExp(r'ORDER_TOTAL=([0-9]+(?:\.[0-9]+)?)').firstMatch(notes);
-            salesValue = double.tryParse(m?.group(1) ?? '') ?? 0.0;
+        final visitCheckInTime = visit['check_in_at'] ??
+            visit['checkInTime'] ??
+            visit['started_at'] ??
+            visit['startedAt'] ??
+            visit['created_at'] ??
+            visit['createdAt'];
+        if (isDailyLogin) {
+          final duplicateKey = '${userId.isNotEmpty ? userId : (user['email'] ?? visit['executiveEmail'] ?? '')}|${localDayKey(visitCheckInTime)}';
+          if (attendanceDailyKeys.contains(duplicateKey)) {
+            continue;
           }
         }
 
-        // Hide internal ORDER_TOTAL tag from client remarks UI.
+        double salesValue = 0.0;
+        salesValue = double.tryParse(
+              (visit['salesValue'] ?? visit['sales_value'] ?? visit['order_total'] ?? '0').toString(),
+            ) ??
+            0.0;
+        if (salesValue <= 0 && visitId.isNotEmpty && orderTotalByVisitId.containsKey(visitId)) {
+          salesValue = orderTotalByVisitId[visitId]!;
+        }
+        if (salesValue <= 0 && notes.contains('ORDER_TOTAL=')) {
+          final m = RegExp(r'ORDER_TOTAL=([0-9]+(?:\.[0-9]+)?)').firstMatch(notes);
+          salesValue = double.tryParse(m?.group(1) ?? '') ?? 0.0;
+        }
+        rememberActorDetails(
+          keys: actorKeys(
+            userId: userId,
+            email: (user['email'] ?? visit['executiveEmail'] ?? '').toString(),
+          ),
+          selfieUrl: absoluteSelfie,
+          salesValue: salesValue,
+          when: visitCheckInTime,
+        );
+
         var displayRemarks = notes;
         if (displayRemarks.contains('ORDER_TOTAL=')) {
           displayRemarks = displayRemarks
@@ -5625,23 +6130,18 @@ class AppProvider extends ChangeNotifier {
               .trim();
         }
 
-        return {
+        addLog({
           'id': visit['id'],
+          'userId': userId,
           'executiveName': name,
           'executiveEmail': user['email'] ?? visit['executiveEmail'] ?? '',
           'executiveRole': user['role'] ?? visit['executiveRole'] ?? '',
           'outletName': isDailyLogin ? 'Daily field login' : outletName,
-          'outletAddress': isDailyLogin
-              ? (placeFromNotes?.isNotEmpty == true
-                  ? placeFromNotes
-                  : (outlet['address'] ?? visit['outletAddress'] ?? 'Login location'))
-              : (outlet['address'] ?? visit['outletAddress'] ?? ''),
-          'checkInTime': visit['check_in_at'] ?? visit['checkInTime'] ?? visit['started_at'],
+          'outletAddress': outlet['address'] ?? visit['outletAddress'] ?? '',
+          'checkInTime': visitCheckInTime,
           'checkOutTime': visit['check_out_at'] ?? visit['checkOutTime'] ?? visit['ended_at'],
           'salesValue': salesValue,
-          'remarks': isDailyLogin
-              ? 'Daily blink selfie + GPS at field start'
-              : displayRemarks,
+          'remarks': displayRemarks,
           'gpsLat': visit['check_in_lat'] ??
               visit['start_latitude'] ??
               visit['gpsLat'] ??
@@ -5650,14 +6150,76 @@ class AppProvider extends ChangeNotifier {
               visit['start_longitude'] ??
               visit['gpsLng'] ??
               visit['longitude'],
-          'address': isDailyLogin
-              ? (placeFromNotes ?? outlet['address'] ?? visit['outletAddress'] ?? 'Daily field login')
-              : (outlet['address'] ?? visit['outletAddress'] ?? visit['address']),
+          'address': placeFromNotes ??
+              outlet['address'] ??
+              visit['outletAddress'] ??
+              visit['address'],
           'selfieUrl': absoluteSelfie,
           'status': visit['status'],
           'isDailyLogin': isDailyLogin,
-        };
-      }).whereType<Map<String, dynamic>>().toList();
+          'source': 'visit',
+        });
+      }
+
+      // 3) Always surface live GPS as an activity card. Attendance check-in can be hours old,
+      // while GPS proves the executive is active now.
+      try {
+        final live = await _api.production.gpsLive();
+        for (final row in live) {
+          final userId = (row['user_id'] ?? row['userId'] ?? '').toString();
+          final user = usersById[userId] ?? {};
+          if (_isHiddenFromOrgActivity(
+            role: user['role']?.toString() ?? row['role']?.toString(),
+            name: user['name']?.toString() ?? row['user_name']?.toString(),
+            email: user['email']?.toString() ?? row['email']?.toString(),
+          )) {
+            continue;
+          }
+          final timestamp = row['logged_at'] ?? row['timestamp'] ?? row['created_at'];
+          final email = (user['email'] ?? row['email'] ?? row['user_email'] ?? '').toString();
+          final keys = actorKeys(userId: userId, email: email);
+          final latestSelfie = keys
+                  .map((key) => latestSelfieByActor[key])
+                  .firstWhere((value) => value != null && value.isNotEmpty, orElse: () => null) ??
+              '';
+          final latestSales = keys
+                  .map((key) => latestSalesByActor[key])
+                  .firstWhere((value) => value != null && value > 0, orElse: () => null) ??
+              0.0;
+          addLog({
+            'id': 'gps-login-${row['id'] ?? userId}-${timestamp ?? ''}',
+            'userId': userId,
+            'executiveName': user['name'] ?? row['user_name'] ?? user['email'] ?? row['email'] ?? 'Executive',
+            'executiveEmail': email,
+            'executiveRole': user['role'] ?? row['role'] ?? 'executive',
+            'outletName': 'Live GPS update',
+            'outletAddress': row['address'] ?? 'Production GPS live ping',
+            'checkInTime': timestamp,
+            'checkOutTime': null,
+            'salesValue': latestSales,
+            'remarks': 'Production GPS live ping',
+            'gpsLat': row['latitude'] ?? row['lat'],
+            'gpsLng': row['longitude'] ?? row['lng'] ?? row['lon'],
+            'address': row['address'] ?? 'Production GPS live ping',
+            'selfieUrl': latestSelfie,
+            'status': 'gps_live',
+            'isDailyLogin': false,
+            'source': 'gps_live',
+          });
+        }
+      } catch (e) {
+        print('Admin live GPS login fallback failed: $e');
+      }
+
+      merged.sort((a, b) {
+        final ta = DateTime.tryParse(a['checkInTime']?.toString() ?? '') ??
+            DateTime.fromMillisecondsSinceEpoch(0);
+        final tb = DateTime.tryParse(b['checkInTime']?.toString() ?? '') ??
+            DateTime.fromMillisecondsSinceEpoch(0);
+        return tb.compareTo(ta);
+      });
+
+      _adminLiveVisitsList = merged;
       notifyListeners();
       return;
     } catch (e) {
@@ -5718,115 +6280,152 @@ class AppProvider extends ChangeNotifier {
       merged.add(ping);
     }
 
-    // 1) Primary: visit check-in / check-out GPS from production (all executives in org).
+    Map<String, Map<String, dynamic>> usersById = {};
     try {
-      final visits = await _api.production.listVisits();
-      Map<String, Map<String, dynamic>> usersById = {};
-      try {
-        final users = await _api.production.adminUsers();
-        for (final u in users) {
-          final id = u['id']?.toString();
-          if (id != null) usersById[id] = u;
-        }
-      } catch (_) {}
+      final users = await _api.production.adminUsers();
+      for (final u in users) {
+        final id = u['id']?.toString();
+        if (id != null) usersById[id] = u;
+      }
+    } catch (_) {}
 
-      for (final visit in visits) {
-        final userId = visit['user_id']?.toString() ?? '';
-        final user = usersById[userId] ?? {};
+    Map<String, dynamic> mapGpsRow(Map row, {required String source, String? startPoint}) {
+      final userId = (row['user_id'] ?? row['userId'] ?? '').toString();
+      final user = usersById[userId] ?? {};
+      final name = (user['name'] ??
+              row['user_name'] ??
+              row['executiveName'] ??
+              user['email'] ??
+              row['email'] ??
+              'Executive')
+          .toString();
+      final email = (user['email'] ?? row['user_email'] ?? row['email'] ?? '').toString();
+      return {
+        'id': row['id'] ?? _uuid.v4(),
+        'latitude': row['latitude'] ?? row['lat'],
+        'longitude': row['longitude'] ?? row['lng'] ?? row['lon'],
+        'address': row['address'],
+        'timestamp': row['logged_at'] ?? row['timestamp'] ?? row['created_at'],
+        'startPoint': startPoint ?? row['tracking_start_point'] ?? (source == 'gps_live' ? 'LIVE' : 'TRACKING'),
+        'userId': userId,
+        'executiveName': name,
+        'executiveEmail': email,
+        'deviceId': row['device_id'] ?? row['deviceId'],
+        'accuracy': row['accuracy'],
+        'speed': row['speed'],
+        'batteryLevel': row['battery_level'] ?? row['batteryLevel'],
+        'source': source,
+      };
+    }
+
+    // 1) Production live GPS — accurate current positions for admin tracking.
+    try {
+      final live = await _api.production.gpsLive();
+      for (final row in live) {
+        final user = usersById[row['user_id']?.toString() ?? ''] ?? {};
         if (_isHiddenFromOrgActivity(
-          role: user['role']?.toString(),
+          role: user['role']?.toString() ?? row['role']?.toString(),
           name: user['name']?.toString(),
           email: user['email']?.toString(),
         )) {
           continue;
         }
-        final name = (user['name'] ?? user['email'] ?? 'Executive').toString();
-        final email = (user['email'] ?? '').toString();
-        final notes = (visit['notes'] ?? visit['remarks'] ?? '').toString();
-        final isDailyLogin = notes.contains(dailyLoginNotesPrefix);
-
-        final inLat = visit['check_in_lat'] ?? visit['gpsLat'] ?? visit['start_latitude'] ?? visit['latitude'];
-        final inLng = visit['check_in_lng'] ?? visit['gpsLng'] ?? visit['start_longitude'] ?? visit['longitude'];
-        final inTs = visit['check_in_at'] ?? visit['checkInTime'] ?? visit['created_at'];
-        if (inLat != null && inLng != null) {
-          addPing({
-            'id': 'visit-in-${visit['id']}',
-            'latitude': inLat,
-            'longitude': inLng,
-            'address': isDailyLogin
-                ? (visit['check_in_address'] ?? 'Daily field login')
-                : (visit['check_in_address'] ?? visit['address'] ?? 'Visit check-in'),
-            'timestamp': inTs,
-            'startPoint': isDailyLogin ? 'DAILY_LOGIN' : 'VISIT_CHECKIN',
-            'userId': userId,
-            'executiveName': name,
-            'executiveEmail': email,
-            'source': isDailyLogin ? 'daily_login' : 'visit',
-          });
-        }
-
-        if (isDailyLogin) continue; // daily login is a single point-in-time event
-
-        final outLat = visit['check_out_lat'] ?? visit['end_latitude'];
-        final outLng = visit['check_out_lng'] ?? visit['end_longitude'];
-        final outTs = visit['check_out_at'] ?? visit['checkOutTime'];
-        if (outLat != null && outLng != null) {
-          addPing({
-            'id': 'visit-out-${visit['id']}',
-            'latitude': outLat,
-            'longitude': outLng,
-            'address': visit['check_out_address'] ?? 'Visit check-out',
-            'timestamp': outTs,
-            'startPoint': 'VISIT_CHECKOUT',
-            'userId': userId,
-            'executiveName': name,
-            'executiveEmail': email,
-            'source': 'visit',
-          });
-        }
+        addPing(mapGpsRow(row, source: 'gps_live', startPoint: 'LIVE'));
       }
     } catch (e) {
-      print('Admin GPS from visits failed: $e');
+      print('Admin GPS live failed: $e');
     }
 
-    // 2) Optional: GET /gps/log if server supports listing (many deploys only have POST).
+    // 2) Production GPS history — trail for the day / recent movement.
     try {
-      final response = await _apiClient.get(ApiEndpoints.gpsLog);
-      if (response.statusCode == 200) {
-        final raw = _responseList(response, 'logs');
-        final alt = raw.isEmpty ? _responseList(response, 'pings') : raw;
-        final body = response.data;
-        final fromBody = body is List
-            ? body
-            : (body is Map && body['data'] is List ? body['data'] as List : const <dynamic>[]);
-        final list = alt.isNotEmpty ? alt : fromBody;
-        for (final row in list) {
-          if (row is! Map) continue;
-          final map = Map<String, dynamic>.from(row);
-          final role = map['user_role']?.toString() ?? map['role']?.toString();
-          final name = map['user_name']?.toString() ?? map['executiveName']?.toString() ?? map['name']?.toString();
-          final email = map['user_email']?.toString() ?? map['email']?.toString();
-          if (_isHiddenFromOrgActivity(role: role, name: name, email: email)) continue;
-          addPing({
-            'id': map['id'] ?? _uuid.v4(),
-            'latitude': map['latitude'] ?? map['lat'],
-            'longitude': map['longitude'] ?? map['lng'] ?? map['lon'],
-            'address': map['address'],
-            'timestamp': map['timestamp'] ?? map['created_at'] ?? map['logged_at'],
-            'startPoint': map['tracking_start_point'] ?? map['startPoint'] ?? 'TRACKING',
-            'userId': map['user_id'] ?? map['userId'],
-            'executiveName': name ?? 'Executive',
-            'executiveEmail': email ?? '',
-            'source': 'gps_api',
-          });
+      final history = await _api.production.gpsHistory(page: 1, perPage: 150);
+      for (final row in history) {
+        final user = usersById[row['user_id']?.toString() ?? ''] ?? {};
+        if (_isHiddenFromOrgActivity(
+          role: user['role']?.toString() ?? row['role']?.toString(),
+          name: user['name']?.toString(),
+          email: user['email']?.toString(),
+        )) {
+          continue;
+        }
+        addPing(mapGpsRow(row, source: 'gps_history'));
+      }
+    } catch (e) {
+      print('Admin GPS history failed: $e');
+    }
+
+    // 3) Fallback: visit check-in / check-out GPS if live/history empty.
+    if (merged.isEmpty) {
+      try {
+        final visits = await _api.production.listVisits();
+        for (final visit in visits) {
+          final userId = visit['user_id']?.toString() ?? '';
+          final user = usersById[userId] ?? {};
+          if (_isHiddenFromOrgActivity(
+            role: user['role']?.toString(),
+            name: user['name']?.toString(),
+            email: user['email']?.toString(),
+          )) {
+            continue;
+          }
+          final name = (user['name'] ?? user['email'] ?? 'Executive').toString();
+          final email = (user['email'] ?? '').toString();
+          final notes = (visit['notes'] ?? visit['remarks'] ?? '').toString();
+          final isDailyLogin = notes.contains(dailyLoginNotesPrefix);
+
+          final inLat = visit['check_in_lat'] ?? visit['gpsLat'] ?? visit['start_latitude'] ?? visit['latitude'];
+          final inLng = visit['check_in_lng'] ?? visit['gpsLng'] ?? visit['start_longitude'] ?? visit['longitude'];
+          final inTs = visit['check_in_at'] ?? visit['checkInTime'] ?? visit['created_at'];
+          if (inLat != null && inLng != null) {
+            addPing({
+              'id': 'visit-in-${visit['id']}',
+              'latitude': inLat,
+              'longitude': inLng,
+              'address': isDailyLogin
+                  ? (visit['check_in_address'] ?? 'Daily field login')
+                  : (visit['check_in_address'] ?? visit['address'] ?? 'Visit check-in'),
+              'timestamp': inTs,
+              'startPoint': isDailyLogin ? 'DAILY_LOGIN' : 'VISIT_CHECKIN',
+              'userId': userId,
+              'executiveName': name,
+              'executiveEmail': email,
+              'source': isDailyLogin ? 'daily_login' : 'visit',
+            });
+          }
+        }
+      } catch (e) {
+        print('Admin GPS from visits failed: $e');
+      }
+    }
+
+    // 4) Super-admin: enrich with device/session info when available.
+    try {
+      final role = (_role ?? '').toLowerCase();
+      if (role == 'super_admin' || role == 'superadmin') {
+        final userIds = merged
+            .map((p) => p['userId']?.toString() ?? '')
+            .where((id) => id.isNotEmpty)
+            .toSet()
+            .take(12);
+        for (final uid in userIds) {
+          try {
+            final sessions = await _api.production.adminUserSessions(uid);
+            if (sessions.isEmpty) continue;
+            final active = sessions.firstWhere(
+              (s) => s['is_revoked'] != true && s['revoked'] != true,
+              orElse: () => sessions.first,
+            );
+            for (final ping in merged.where((p) => p['userId']?.toString() == uid)) {
+              ping['deviceId'] ??= active['device_id'] ?? active['deviceId'];
+              ping['deviceType'] ??= active['device_type'] ?? active['deviceType'];
+              ping['sessionIp'] ??= active['ip_address'] ?? active['ipAddress'];
+            }
+          } catch (_) {}
         }
       }
-    } catch (_) {
-      // POST-only GPS endpoint — ignore.
-    }
+    } catch (_) {}
 
-    // 3) Local device pings — only when an executive is using this device.
-    // Never attribute local DB pings to admin/super_admin (caused Lakshmiraj showing in Logs).
+    // 5) Local device pings — only when an executive is using this device.
     if (_isExecutiveRole()) {
       try {
         final localGps = await DatabaseHelper.instance.queryAll('offline_gps_pings');
@@ -5855,7 +6454,6 @@ class AppProvider extends ChangeNotifier {
       return tb.compareTo(ta);
     });
 
-    // Final privacy filter: never show super-admin / Lakshmiraj activity.
     final filtered = merged.where((ping) {
       return !_isHiddenFromOrgActivity(
         name: ping['executiveName']?.toString(),
@@ -5863,7 +6461,6 @@ class AppProvider extends ChangeNotifier {
       );
     }).toList();
 
-    // Resolve human-readable place names for pings that only have coordinates.
     final limited = filtered.take(200).toList();
     var geocodeBudget = 30;
     for (final ping in limited) {
@@ -5881,7 +6478,6 @@ class AppProvider extends ChangeNotifier {
         resolved = await _resolveAddressCached(lat, lng);
       }
       ping['address'] = resolved ?? 'GPS ${lat.toStringAsFixed(5)}, ${lng.toStringAsFixed(5)}';
-      // Backfill local DB when this ping came from the device.
       if (ping['source'] == 'local' && ping['id'] != null && resolved != null) {
         try {
           await DatabaseHelper.instance.update(

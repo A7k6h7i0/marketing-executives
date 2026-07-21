@@ -19,6 +19,8 @@ class ApiEndpoints {
   static const String attendanceCheckIn = '$apiPrefix/attendance/check-in';
   static const String attendanceCheckOut = '$apiPrefix/attendance/check-out';
   static const String attendanceMy = '$apiPrefix/attendance/my';
+  /// Admin/manager: org-wide attendance (login times for Logs / Team).
+  static const String attendance = '$apiPrefix/attendance';
 
   // ── Breaks (friend backlog — keep paths ready) ────────────────────
   static const String breaksStart = '$apiPrefix/breaks/start';
@@ -27,6 +29,12 @@ class ApiEndpoints {
 
   // ── GPS ───────────────────────────────────────────────────────────
   static const String gpsLog = '$apiPrefix/gps/log';
+  static const String gpsLive = '$apiPrefix/gps/live';
+  static const String gpsHistory = '$apiPrefix/gps/history';
+  static String adminUserSessions(String userId) => '$apiPrefix/admin/users/$userId/sessions';
+  /// Super-admin: revoke all device sessions so the user can sign in again.
+  static String adminUserForceLogout(String userId) =>
+      '$apiPrefix/admin/users/$userId/force-logout';
 
   // ── Field routes & outlets ────────────────────────────────────────
   static const String fieldRoutes = '$apiPrefix/field-routes';
@@ -82,6 +90,8 @@ class ApiEndpoints {
   // ── Uploads ───────────────────────────────────────────────────────
   static const String uploadSelfie = '$apiPrefix/uploads/selfie';
   static const String mediaUpload = '$apiPrefix/media/upload';
+  /// Production login / daily selfie upload (preferred).
+  static const String uploadLoginSelfie = '$apiPrefix/media/upload-login-selfie';
 
   // ── Admin ─────────────────────────────────────────────────────────
   static const String adminStats = '$apiPrefix/admin/stats';

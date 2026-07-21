@@ -49,10 +49,25 @@ class ProductionApiService {
     return Map<String, dynamic>.from(data as Map);
   }
 
-  Future<void> logout() async {
-    try {
-      await _client.post(ApiEndpoints.logout);
-    } catch (_) {}
+  Future<void> logout({String? deviceId, String? refreshToken}) async {
+    final response = await _client.post(ApiEndpoints.logout, data: {
+      if (deviceId != null && deviceId.isNotEmpty) ...{
+        'device_id': deviceId,
+        'deviceId': deviceId,
+      },
+      if (refreshToken != null && refreshToken.isNotEmpty) 'refresh_token': refreshToken,
+    });
+    if (response.statusCode != null && response.statusCode! >= 400) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        type: DioExceptionType.badResponse,
+        message: ApiClient.errorMessage(
+              DioException(requestOptions: response.requestOptions, response: response),
+            ) ??
+            'Logout failed',
+      );
+    }
   }
 
   // ── Attendance ────────────────────────────────────────────────────
@@ -93,6 +108,44 @@ class ProductionApiService {
     return const [];
   }
 
+  Future<Map<String, dynamic>?> attendanceCheckOut({
+    required double latitude,
+    required double longitude,
+  }) async {
+    final response = await _client.post(ApiEndpoints.attendanceCheckOut, data: {
+      'latitude': latitude,
+      'longitude': longitude,
+    });
+    if (response.statusCode != null && response.statusCode! >= 400) return null;
+    final data = ApiClient.unwrap(response);
+    if (data is Map) return Map<String, dynamic>.from(data);
+    return null;
+  }
+
+  /// Admin/manager org attendance feed (used for Login & Visits logs).
+  Future<List<Map<String, dynamic>>> attendanceList({int page = 1, int perPage = 100}) async {
+    final response = await _client.get(
+      ApiEndpoints.attendance,
+      queryParameters: {'page': page, 'per_page': perPage},
+    );
+    final data = ApiClient.unwrap(response);
+    if (data is List) {
+      return data.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    }
+    if (data is Map) {
+      final list = data['items'] ?? data['results'] ?? data['attendance'] ?? data['data'];
+      if (list is List) {
+        return list.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+      }
+    }
+    return const [];
+  }
+
+  Future<bool> adminForceLogout(String userId) async {
+    final response = await _client.post(ApiEndpoints.adminUserForceLogout(userId), data: {});
+    return response.statusCode != null && response.statusCode! < 300;
+  }
+
   // ── Breaks (friend backlog — soft fail) ───────────────────────────
   Future<Response> startBreak(String breakType) {
     return _client.post(ApiEndpoints.breaksStart, data: {
@@ -113,17 +166,97 @@ class ProductionApiService {
     required double longitude,
     String? timestamp,
     String? address,
+    String? deviceId,
+    String? trackingStartPoint,
+    double? accuracy,
+    double? speed,
+    double? batteryLevel,
+    String? offlineId,
   }) async {
     final response = await _client.post(ApiEndpoints.gpsLog, data: {
       'latitude': latitude,
       'longitude': longitude,
       'timestamp': timestamp ?? DateTime.now().toUtc().toIso8601String(),
+      'logged_at': timestamp ?? DateTime.now().toUtc().toIso8601String(),
       if (address != null && address.isNotEmpty) 'address': address,
+      if (deviceId != null && deviceId.isNotEmpty) 'device_id': deviceId,
+      if (deviceId != null && deviceId.isNotEmpty) 'deviceId': deviceId,
+      if (trackingStartPoint != null && trackingStartPoint.isNotEmpty) ...{
+        'tracking_start_point': trackingStartPoint,
+        'trackingStartPoint': trackingStartPoint,
+      },
+      if (accuracy != null) 'accuracy': accuracy,
+      if (speed != null) 'speed': speed,
+      if (batteryLevel != null) 'battery_level': batteryLevel,
+      if (offlineId != null && offlineId.isNotEmpty) 'offline_id': offlineId,
     });
-    if (response.statusCode != null && response.statusCode! >= 400) return null;
+    if (response.statusCode != null && response.statusCode! >= 400) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        type: DioExceptionType.badResponse,
+        message: ApiClient.errorMessage(
+              DioException(requestOptions: response.requestOptions, response: response),
+            ) ??
+            'GPS log failed',
+      );
+    }
     final data = ApiClient.unwrap(response);
     if (data is Map) return Map<String, dynamic>.from(data);
     return null;
+  }
+
+  /// Admin/manager: latest live GPS positions for org executives.
+  Future<List<Map<String, dynamic>>> gpsLive() async {
+    final response = await _client.get(ApiEndpoints.gpsLive);
+    final data = ApiClient.unwrap(response);
+    if (data is List) {
+      return data.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    }
+    if (data is Map) {
+      final list = data['pings'] ?? data['items'] ?? data['results'] ?? data['data'];
+      if (list is List) {
+        return list.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+      }
+    }
+    return const [];
+  }
+
+  /// Admin/manager: historical GPS trail for the org (optional user filter).
+  Future<List<Map<String, dynamic>>> gpsHistory({
+    String? userId,
+    int page = 1,
+    int perPage = 100,
+  }) async {
+    final response = await _client.get(
+      ApiEndpoints.gpsHistory,
+      queryParameters: {
+        'page': page,
+        'per_page': perPage,
+        if (userId != null && userId.isNotEmpty) 'user_id': userId,
+      },
+    );
+    final data = ApiClient.unwrap(response);
+    if (data is List) {
+      return data.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    }
+    if (data is Map) {
+      final list = data['pings'] ?? data['items'] ?? data['results'] ?? data['data'];
+      if (list is List) {
+        return list.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+      }
+    }
+    return const [];
+  }
+
+  /// Super-admin: device/session info for a user.
+  Future<List<Map<String, dynamic>>> adminUserSessions(String userId) async {
+    final response = await _client.get(ApiEndpoints.adminUserSessions(userId));
+    final data = ApiClient.unwrap(response);
+    if (data is List) {
+      return data.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    }
+    return const [];
   }
 
   // ── Field routes & outlets ────────────────────────────────────────
@@ -550,23 +683,77 @@ class ProductionApiService {
   }
 
   // ── Uploads ───────────────────────────────────────────────────────
+  /// Upload login/daily selfie to production.
+  /// Prefer [ApiEndpoints.uploadLoginSelfie]; fall back to legacy paths if needed.
   Future<String?> uploadSelfie(File file) async {
-    try {
-      final form = FormData.fromMap({
-        'file': await MultipartFile.fromFile(file.path, filename: file.uri.pathSegments.last),
-      });
-      final response = await _client.post(ApiEndpoints.uploadSelfie, data: form);
-      if (response.statusCode != null && response.statusCode! >= 400) return null;
-      final body = response.data;
-      final data = body is Map && body['data'] != null ? body['data'] : body;
-      if (data is Map) {
-        final url = data['url']?.toString() ?? data['path']?.toString();
-        if (url == null) return null;
-        if (url.startsWith('http')) return url;
-        return '${ApiEndpoints.baseUrl}$url';
-      }
-    } catch (_) {}
+    final uploaded = await uploadLoginSelfie(file);
+    if (uploaded != null && uploaded.isNotEmpty) return uploaded;
+
+    // Legacy fallbacks (older deployments).
+    for (final path in [ApiEndpoints.mediaUpload, ApiEndpoints.uploadSelfie]) {
+      final url = await _postSelfieMultipart(file, path);
+      if (url != null && url.isNotEmpty) return url;
+    }
     return null;
+  }
+
+  /// Dedicated production endpoint: POST /api/v1/media/upload-login-selfie
+  Future<String?> uploadLoginSelfie(File file) async {
+    return _postSelfieMultipart(file, ApiEndpoints.uploadLoginSelfie);
+  }
+
+  Future<String?> _postSelfieMultipart(File file, String path) async {
+    final filename = file.uri.pathSegments.isNotEmpty
+        ? file.uri.pathSegments.last
+        : 'login_selfie.jpg';
+
+    // Production has used different multipart field names across revisions.
+    for (final field in ['file', 'selfie', 'image', 'photo', 'login_selfie']) {
+      try {
+        final form = FormData.fromMap({
+          field: await MultipartFile.fromFile(
+            file.path,
+            filename: filename,
+          ),
+        });
+        final response = await _client.post(path, data: form);
+        if (response.statusCode != null && response.statusCode! >= 400) continue;
+
+        final url = _extractUploadedMediaUrl(response.data);
+        if (url != null && url.isNotEmpty) return url;
+      } catch (_) {
+        // Try next field name / path.
+      }
+    }
+    return null;
+  }
+
+  String? _extractUploadedMediaUrl(dynamic body) {
+    dynamic data = body;
+    if (body is Map && body['data'] != null) data = body['data'];
+    if (data is! Map) return null;
+
+    final map = Map<String, dynamic>.from(data);
+    final nested = map['media'] ?? map['file'] ?? map['selfie'];
+    if (nested is Map) {
+      map.addAll(Map<String, dynamic>.from(nested));
+    }
+
+    final raw = (map['url'] ??
+            map['file_url'] ??
+            map['fileUrl'] ??
+            map['media_url'] ??
+            map['mediaUrl'] ??
+            map['public_url'] ??
+            map['publicUrl'] ??
+            map['path'] ??
+            map['location'])
+        ?.toString()
+        .trim();
+    if (raw == null || raw.isEmpty) return null;
+    if (raw.startsWith('http://') || raw.startsWith('https://')) return raw;
+    if (raw.startsWith('/')) return '${ApiEndpoints.baseUrl}$raw';
+    return '${ApiEndpoints.baseUrl}/$raw';
   }
 
   // ── Admin ─────────────────────────────────────────────────────────

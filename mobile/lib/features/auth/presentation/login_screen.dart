@@ -25,6 +25,14 @@ class _LoginScreenState extends State<LoginScreen> {
   final _passwordFocus = FocusNode();
   String? _error;
 
+  bool get _isDeviceLockedError {
+    final err = (_error ?? '').toLowerCase();
+    return err.contains('locked to another device') ||
+        err.contains('already active on another device') ||
+        err.contains('force-logout') ||
+        err.contains('unlock device');
+  }
+
   @override
   void initState() {
     super.initState();
@@ -171,7 +179,10 @@ class _LoginScreenState extends State<LoginScreen> {
               'Blink selfie is required to sign in. Please try again and blink your eyes to capture.');
           return;
         }
-        selfieUrl = await _selfieToDataUrl(photo);
+        // Prefer production upload so admin Logs can load the image URL.
+        selfieUrl = await provider.uploadLoginSelfieFile(photo);
+        // Fallback: data URI only if media upload is temporarily unavailable.
+        selfieUrl ??= await _selfieToDataUrl(photo);
       }
 
       success = await provider.login(
@@ -214,6 +225,145 @@ class _LoginScreenState extends State<LoginScreen> {
       return;
     }
     setState(() => _error = err);
+  }
+
+  Future<void> _showSuperAdminUnlockDialog() async {
+    final lockedUserController = TextEditingController(text: _emailController.text.trim());
+    final superEmailController = TextEditingController(text: 'lakshmiraj@addphonebook.com');
+    final superPasswordController = TextEditingController();
+    final superOrgSlugController = TextEditingController(text: _orgSlugController.text.trim());
+    String? dialogError;
+    bool unlocking = false;
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: !unlocking,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            Future<void> unlock() async {
+              final lockedUser = lockedUserController.text.trim();
+              final superEmail = superEmailController.text.trim();
+              final superPassword = superPasswordController.text;
+              if (lockedUser.isEmpty || superEmail.isEmpty || superPassword.isEmpty) {
+                setDialogState(() {
+                  dialogError = 'Enter locked user, super-admin email, and password.';
+                });
+                return;
+              }
+              setDialogState(() {
+                unlocking = true;
+                dialogError = null;
+              });
+
+              final provider = Provider.of<AppProvider>(context, listen: false);
+              final ok = await provider.emergencyForceLogoutWithSuperAdmin(
+                superAdminEmail: superEmail,
+                superAdminPassword: superPassword,
+                targetEmailOrUserId: lockedUser,
+                orgSlug: superOrgSlugController.text.trim().isEmpty
+                    ? null
+                    : superOrgSlugController.text.trim(),
+              );
+              if (!mounted || !dialogContext.mounted) return;
+
+              if (ok) {
+                Navigator.pop(dialogContext);
+                setState(() => _error = null);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Device unlocked on production. Try sign in again.'),
+                    backgroundColor: Colors.green,
+                  ),
+                );
+                return;
+              }
+
+              setDialogState(() {
+                unlocking = false;
+                dialogError = provider.lastActionError ?? 'Unlock failed.';
+              });
+            }
+
+            return AlertDialog(
+              title: const Text('Super-admin unlock'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextField(
+                      controller: lockedUserController,
+                      decoration: const InputDecoration(
+                        labelText: 'Locked user email or user id',
+                        helperText: 'Use user id if production blocks super-admin user lookup.',
+                        prefixIcon: Icon(Icons.person_off_outlined),
+                      ),
+                      keyboardType: TextInputType.emailAddress,
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: superEmailController,
+                      decoration: const InputDecoration(
+                        labelText: 'Super-admin email',
+                        prefixIcon: Icon(Icons.admin_panel_settings_outlined),
+                      ),
+                      keyboardType: TextInputType.emailAddress,
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: superPasswordController,
+                      decoration: const InputDecoration(
+                        labelText: 'Super-admin password',
+                        prefixIcon: Icon(Icons.lock_outline),
+                      ),
+                      obscureText: true,
+                      onSubmitted: (_) => unlocking ? null : unlock(),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: superOrgSlugController,
+                      decoration: const InputDecoration(
+                        labelText: 'Organisation slug optional',
+                        prefixIcon: Icon(Icons.business_outlined),
+                      ),
+                    ),
+                    if (dialogError != null) ...[
+                      const SizedBox(height: 12),
+                      Text(
+                        dialogError!,
+                        style: const TextStyle(color: Colors.red, fontSize: 12),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: unlocking ? null : () => Navigator.pop(dialogContext),
+                  child: const Text('Cancel'),
+                ),
+                ElevatedButton.icon(
+                  onPressed: unlocking ? null : unlock,
+                  icon: unlocking
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.lock_open),
+                  label: Text(unlocking ? 'Unlocking...' : 'Unlock device'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    lockedUserController.dispose();
+    superEmailController.dispose();
+    superPasswordController.dispose();
+    superOrgSlugController.dispose();
   }
 
   @override
@@ -310,6 +460,14 @@ class _LoginScreenState extends State<LoginScreen> {
                         if (_error != null) ...[
                           const SizedBox(height: BestieTokens.s3),
                           BestieErrorBanner(message: _error!),
+                          if (_isDeviceLockedError) ...[
+                            const SizedBox(height: BestieTokens.s2),
+                            OutlinedButton.icon(
+                              onPressed: provider.isLoading ? null : _showSuperAdminUnlockDialog,
+                              icon: const Icon(Icons.lock_open_outlined),
+                              label: const Text('Super-admin unlock device'),
+                            ),
+                          ],
                         ],
                         const SizedBox(height: BestieTokens.s4),
                         BestiePrimaryButton(

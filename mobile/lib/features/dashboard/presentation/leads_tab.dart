@@ -151,7 +151,14 @@ class _LeadsTabState extends State<LeadsTab> {
     return (pos.latitude, pos.longitude);
   }
 
+  void _dismissKeyboard() {
+    FocusScope.of(context).unfocus();
+    _queryFocus.unfocus();
+    _areaFocus.unfocus();
+  }
+
   Future<void> _searchShops(AppProvider provider) async {
+    _dismissKeyboard();
     final query = _queryController.text.trim();
     _commitAreaFromField();
     final areas = List<String>.from(_selectedAreas);
@@ -246,300 +253,320 @@ class _LeadsTabState extends State<LeadsTab> {
 
     return Stack(
       children: [
-        ListView(
-          padding: EdgeInsets.fromLTRB(16, 16, 16, bottomPad),
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Row(
-              children: [
-                const Expanded(
-                  child: Text(
-                    'PROSPECTS',
-                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.grey),
-                  ),
-                ),
-                TextButton.icon(
-                  onPressed: () {
-                    setState(() => _section = 1);
-                    appProvider.fetchSavedLeads();
-                  },
-                  icon: const Icon(Icons.bookmark_outline, size: 18),
-                  label: Text('SAVED (${appProvider.savedLeads.length})'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            SegmentedButton<int>(
-              showSelectedIcon: false,
-              segments: [
-                const ButtonSegment(
-                  value: 0,
-                  label: Text('Find shops'),
-                  icon: Icon(Icons.search, size: 16),
-                ),
-                ButtonSegment(
-                  value: 1,
-                  label: Text('Saved (${appProvider.savedLeads.length})'),
-                  icon: const Icon(Icons.bookmark, size: 16),
-                ),
-              ],
-              selected: {_section},
-              onSelectionChanged: (s) {
-                setState(() => _section = s.first);
-                if (s.first == 1) appProvider.fetchSavedLeads();
-              },
-            ),
-            const SizedBox(height: 16),
-            if (_section == 0) ...[
-              Card(
-                color: Colors.blue.shade50,
-                child: const Padding(
-                  padding: EdgeInsets.all(12.0),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text('Find shops in an area', style: TextStyle(fontWeight: FontWeight.bold, color: BestieTokens.cBrand)),
-                      SizedBox(height: 6),
-                      Text(
-                        'Type a shop type for suggestions (e.g. ply → Plywood). '
-                        'Add multiple areas as chips, then search across all of them.',
-                        style: TextStyle(fontSize: 13, color: Colors.black87),
+            // Fixed header: tabs + search controls stay put while results scroll.
+            Material(
+              color: BestieTokens.cBg,
+              elevation: 0.5,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 10),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Row(
+                      children: [
+                        const Expanded(
+                          child: Text(
+                            'PROSPECTS',
+                            style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.grey),
+                          ),
+                        ),
+                        TextButton.icon(
+                          onPressed: () {
+                            _dismissKeyboard();
+                            setState(() => _section = 1);
+                            appProvider.fetchSavedLeads();
+                          },
+                          icon: const Icon(Icons.bookmark_outline, size: 18),
+                          label: Text('SAVED (${appProvider.savedLeads.length})'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    SegmentedButton<int>(
+                      showSelectedIcon: false,
+                      segments: [
+                        const ButtonSegment(
+                          value: 0,
+                          label: Text('Find shops'),
+                          icon: Icon(Icons.search, size: 16),
+                        ),
+                        ButtonSegment(
+                          value: 1,
+                          label: Text('Saved (${appProvider.savedLeads.length})'),
+                          icon: const Icon(Icons.bookmark, size: 16),
+                        ),
+                      ],
+                      selected: {_section},
+                      onSelectionChanged: (s) {
+                        _dismissKeyboard();
+                        setState(() => _section = s.first);
+                        if (s.first == 1) appProvider.fetchSavedLeads();
+                      },
+                    ),
+                    if (_section == 0) ...[
+                      const SizedBox(height: 12),
+                      RawAutocomplete<String>(
+                        textEditingController: _queryController,
+                        focusNode: _queryFocus,
+                        optionsBuilder: (textEditingValue) {
+                          return _categoryMatches(textEditingValue.text);
+                        },
+                        displayStringForOption: (o) => o,
+                        onSelected: (value) {
+                          _queryController.text = value;
+                          _queryController.selection = TextSelection.collapsed(offset: value.length);
+                          _dismissKeyboard();
+                        },
+                        fieldViewBuilder: (context, textController, focusNode, onFieldSubmitted) {
+                          return TextField(
+                            controller: textController,
+                            focusNode: focusNode,
+                            decoration: const InputDecoration(
+                              labelText: 'Shop name / type',
+                              hintText: 'e.g. Plywood, Diagnostics, Hardware',
+                              border: OutlineInputBorder(),
+                              isDense: true,
+                              prefixIcon: Icon(Icons.storefront),
+                            ),
+                            textInputAction: TextInputAction.next,
+                            onSubmitted: (_) {
+                              onFieldSubmitted();
+                              _areaFocus.requestFocus();
+                            },
+                          );
+                        },
+                        optionsViewBuilder: (context, onSelected, options) {
+                          final opts = options.toList();
+                          if (opts.isEmpty) return const SizedBox.shrink();
+                          return Align(
+                            alignment: Alignment.topLeft,
+                            child: Material(
+                              elevation: 4,
+                              borderRadius: BorderRadius.circular(10),
+                              child: ConstrainedBox(
+                                constraints: const BoxConstraints(maxHeight: 200, maxWidth: 420),
+                                child: ListView.builder(
+                                  padding: EdgeInsets.zero,
+                                  shrinkWrap: true,
+                                  itemCount: opts.length,
+                                  itemBuilder: (context, index) {
+                                    final option = opts[index];
+                                    return ListTile(
+                                      dense: true,
+                                      leading: const Icon(Icons.search, size: 18, color: BestieTokens.cBrand),
+                                      title: Text(option),
+                                      onTap: () => onSelected(option),
+                                    );
+                                  },
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: _areaController,
+                        focusNode: _areaFocus,
+                        decoration: InputDecoration(
+                          labelText: 'Area / locality',
+                          hintText: 'e.g. Kukatpally — tap + or Enter',
+                          border: const OutlineInputBorder(),
+                          isDense: true,
+                          prefixIcon: const Icon(Icons.location_city),
+                          suffixIcon: IconButton(
+                            tooltip: 'Add area',
+                            icon: const Icon(Icons.add_circle, color: BestieTokens.cBrand),
+                            onPressed: () {
+                              _commitAreaFromField();
+                              _dismissKeyboard();
+                            },
+                          ),
+                        ),
+                        textInputAction: TextInputAction.done,
+                        onSubmitted: (_) {
+                          _commitAreaFromField();
+                          _dismissKeyboard();
+                        },
+                      ),
+                      if (_selectedAreas.isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: _selectedAreas.map((area) {
+                            return Container(
+                              padding: const EdgeInsets.fromLTRB(12, 6, 6, 6),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFFF3F4F6),
+                                borderRadius: BorderRadius.circular(24),
+                                border: Border.all(color: const Color(0xFFD1D5DB)),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  ConstrainedBox(
+                                    constraints: const BoxConstraints(maxWidth: 180),
+                                    child: Text(
+                                      area,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.w500,
+                                        color: Colors.black87,
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 4),
+                                  InkWell(
+                                    borderRadius: BorderRadius.circular(12),
+                                    onTap: () => _removeAreaChip(area),
+                                    child: const Padding(
+                                      padding: EdgeInsets.all(4),
+                                      child: Icon(Icons.close, size: 16, color: Colors.black54),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            );
+                          }).toList(),
+                        ),
+                      ],
+                      const SizedBox(height: 8),
+                      ElevatedButton.icon(
+                        onPressed: _isSearching ? null : () => _searchShops(appProvider),
+                        icon: _isSearching
+                            ? const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                              )
+                            : const Icon(Icons.search),
+                        label: Text(_isSearching ? 'Searching…' : 'SEARCH SHOPS'),
+                      ),
+                      if (_searchError != null) ...[
+                        const SizedBox(height: 8),
+                        Text(_searchError!, style: const TextStyle(color: Colors.orange, fontSize: 12)),
+                      ],
+                    ] else ...[
+                      const SizedBox(height: 10),
+                      const Text(
+                        'Bookmark shops from Find shops, then convert them into outlets for today’s plan.',
+                        style: TextStyle(fontSize: 13, color: Colors.black54),
                       ),
                     ],
-                  ),
+                  ],
                 ),
               ),
-              const SizedBox(height: 12),
-              RawAutocomplete<String>(
-                textEditingController: _queryController,
-                focusNode: _queryFocus,
-                optionsBuilder: (textEditingValue) {
-                  return _categoryMatches(textEditingValue.text);
-                },
-                displayStringForOption: (o) => o,
-                onSelected: (value) {
-                  _queryController.text = value;
-                  _queryController.selection = TextSelection.collapsed(offset: value.length);
-                },
-                fieldViewBuilder: (context, textController, focusNode, onFieldSubmitted) {
-                  return TextField(
-                    controller: textController,
-                    focusNode: focusNode,
-                    decoration: const InputDecoration(
-                      labelText: 'Shop name / type',
-                      hintText: 'e.g. Plywood, Diagnostics, Hardware',
-                      border: OutlineInputBorder(),
-                      prefixIcon: Icon(Icons.storefront),
-                      helperText: 'Suggestions appear as you type',
-                    ),
-                    textInputAction: TextInputAction.next,
-                    onSubmitted: (_) => onFieldSubmitted(),
-                  );
-                },
-                optionsViewBuilder: (context, onSelected, options) {
-                  final opts = options.toList();
-                  if (opts.isEmpty) return const SizedBox.shrink();
-                  return Align(
-                    alignment: Alignment.topLeft,
-                    child: Material(
-                      elevation: 4,
-                      borderRadius: BorderRadius.circular(10),
-                      child: ConstrainedBox(
-                        constraints: const BoxConstraints(maxHeight: 220, maxWidth: 420),
-                        child: ListView.builder(
-                          padding: EdgeInsets.zero,
-                          shrinkWrap: true,
-                          itemCount: opts.length,
-                          itemBuilder: (context, index) {
-                            final option = opts[index];
-                            return ListTile(
-                              dense: true,
-                              leading: const Icon(Icons.search, size: 18, color: BestieTokens.cBrand),
-                              title: Text(option),
-                              onTap: () => onSelected(option),
-                            );
-                          },
+            ),
+            const Divider(height: 1),
+            // Only results / saved list scroll.
+            Expanded(
+              child: _section == 0
+                  ? ListView(
+                      keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+                      padding: EdgeInsets.fromLTRB(16, 12, 16, bottomPad),
+                      children: [
+                        Text(
+                          'RESULTS (${appProvider.nearbyLeads.length})',
+                          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.grey),
                         ),
-                      ),
-                    ),
-                  );
-                },
-              ),
-              const SizedBox(height: 10),
-              TextField(
-                controller: _areaController,
-                focusNode: _areaFocus,
-                decoration: InputDecoration(
-                  labelText: 'Area / locality',
-                  hintText: 'e.g. Kukatpally — tap + or press Enter',
-                  border: const OutlineInputBorder(),
-                  prefixIcon: const Icon(Icons.location_city),
-                  suffixIcon: IconButton(
-                    tooltip: 'Add area',
-                    icon: const Icon(Icons.add_circle, color: BestieTokens.cBrand),
-                    onPressed: _commitAreaFromField,
-                  ),
-                  helperText: _selectedAreas.isEmpty
-                      ? 'Add one or more areas, then SEARCH'
-                      : '${_selectedAreas.length} area(s) selected',
-                ),
-                textInputAction: TextInputAction.done,
-                onSubmitted: (_) => _commitAreaFromField(),
-              ),
-              if (_selectedAreas.isNotEmpty) ...[
-                const SizedBox(height: 10),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: _selectedAreas.map((area) {
-                    return Container(
-                      padding: const EdgeInsets.fromLTRB(12, 6, 6, 6),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFF3F4F6),
-                        borderRadius: BorderRadius.circular(24),
-                        border: Border.all(color: const Color(0xFFD1D5DB)),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          ConstrainedBox(
-                            constraints: const BoxConstraints(maxWidth: 180),
+                        const SizedBox(height: 8),
+                        if (appProvider.nearbyLeads.isEmpty)
+                          const Padding(
+                            padding: EdgeInsets.symmetric(vertical: 32),
                             child: Text(
-                              area,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                fontSize: 13,
-                                fontWeight: FontWeight.w500,
-                                color: Colors.black87,
-                              ),
+                              'No results yet. Enter shop type, add areas, then tap SEARCH SHOPS.',
+                              style: TextStyle(color: Colors.grey),
+                              textAlign: TextAlign.center,
                             ),
-                          ),
-                          const SizedBox(width: 4),
-                          InkWell(
-                            borderRadius: BorderRadius.circular(12),
-                            onTap: () => _removeAreaChip(area),
-                            child: const Padding(
-                              padding: EdgeInsets.all(4),
-                              child: Icon(Icons.close, size: 16, color: Colors.black54),
+                          )
+                        else
+                          ...appProvider.nearbyLeads.map((lead) => _ResultCard(lead: lead)),
+                      ],
+                    )
+                  : ListView(
+                      keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+                      padding: EdgeInsets.fromLTRB(16, 12, 16, bottomPad),
+                      children: [
+                        if (appProvider.savedLeads.isEmpty)
+                          const Padding(
+                            padding: EdgeInsets.symmetric(vertical: 32),
+                            child: Text(
+                              'No saved prospects yet. Search shops and tap the bookmark icon.',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(color: Colors.grey),
                             ),
-                          ),
-                        ],
-                      ),
-                    );
-                  }).toList(),
-                ),
-              ],
-              const SizedBox(height: 10),
-              ElevatedButton.icon(
-                onPressed: _isSearching ? null : () => _searchShops(appProvider),
-                icon: _isSearching
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                      )
-                    : const Icon(Icons.search),
-                label: Text(_isSearching ? 'Searching…' : 'SEARCH SHOPS'),
-              ),
-              if (_searchError != null) ...[
-                const SizedBox(height: 12),
-                Text(_searchError!, style: const TextStyle(color: Colors.orange, fontSize: 12)),
-              ],
-              const SizedBox(height: 16),
-              Text(
-                'RESULTS (${appProvider.nearbyLeads.length})',
-                style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.grey),
-              ),
-              const SizedBox(height: 8),
-              if (appProvider.nearbyLeads.isEmpty)
-                const Padding(
-                  padding: EdgeInsets.symmetric(vertical: 24),
-                  child: Text(
-                    'No results yet. Enter shop type, add areas, then tap SEARCH SHOPS.',
-                    style: TextStyle(color: Colors.grey),
-                    textAlign: TextAlign.center,
-                  ),
-                )
-              else
-                ...appProvider.nearbyLeads.map((lead) => _ResultCard(lead: lead)),
-            ] else ...[
-              const Text(
-                'Bookmark shops from Find shops, then convert them into outlets for today’s plan.',
-                style: TextStyle(fontSize: 13, color: Colors.black54),
-              ),
-              const SizedBox(height: 12),
-              if (appProvider.savedLeads.isEmpty)
-                const Padding(
-                  padding: EdgeInsets.symmetric(vertical: 32),
-                  child: Text(
-                    'No saved prospects yet. Search shops and tap the bookmark icon.',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(color: Colors.grey),
-                  ),
-                )
-              else
-                ...appProvider.savedLeads.map((lead) {
-                  final map = Map<String, dynamic>.from(lead as Map);
-                  final status = (map['leadStatus'] ?? 'NEW').toString().toUpperCase();
-                  final converted = status == 'CONVERTED';
-                  final isThisConverting = appProvider.convertingLeadId == map['id']?.toString();
-                  return Card(
-                    margin: const EdgeInsets.only(bottom: 10),
-                    color: converted ? Colors.green.shade50 : Colors.white,
-                    child: Padding(
-                      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          Row(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              CircleAvatar(
-                                backgroundColor: converted ? Colors.green : Colors.orange,
-                                foregroundColor: Colors.white,
-                                child: Icon(converted ? Icons.check : Icons.bookmark),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
+                          )
+                        else
+                          ...appProvider.savedLeads.map((lead) {
+                            final map = Map<String, dynamic>.from(lead as Map);
+                            final status = (map['leadStatus'] ?? 'NEW').toString().toUpperCase();
+                            final converted = status == 'CONVERTED';
+                            final isThisConverting = appProvider.convertingLeadId == map['id']?.toString();
+                            return Card(
+                              margin: const EdgeInsets.only(bottom: 10),
+                              color: converted ? Colors.green.shade50 : Colors.white,
+                              child: Padding(
+                                padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
                                 child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  crossAxisAlignment: CrossAxisAlignment.stretch,
                                   children: [
-                                    Text(
-                                      map['businessName']?.toString() ?? 'Saved outlet',
-                                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                                    Row(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        CircleAvatar(
+                                          backgroundColor: converted ? Colors.green : Colors.orange,
+                                          foregroundColor: Colors.white,
+                                          child: Icon(converted ? Icons.check : Icons.bookmark),
+                                        ),
+                                        const SizedBox(width: 12),
+                                        Expanded(
+                                          child: Column(
+                                            crossAxisAlignment: CrossAxisAlignment.start,
+                                            children: [
+                                              Text(
+                                                map['businessName']?.toString() ?? 'Saved outlet',
+                                                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                                              ),
+                                              if ((map['address'] ?? '').toString().isNotEmpty)
+                                                Text(map['address'].toString(), style: const TextStyle(fontSize: 12, color: Colors.black87)),
+                                              if ((map['businessCategory'] ?? '').toString().isNotEmpty)
+                                                Text(map['businessCategory'].toString(), style: const TextStyle(fontSize: 12, color: Colors.blueGrey)),
+                                            ],
+                                          ),
+                                        ),
+                                      ],
                                     ),
-                                    if ((map['address'] ?? '').toString().isNotEmpty)
-                                      Text(map['address'].toString(), style: const TextStyle(fontSize: 12, color: Colors.black87)),
-                                    if ((map['businessCategory'] ?? '').toString().isNotEmpty)
-                                      Text(map['businessCategory'].toString(), style: const TextStyle(fontSize: 12, color: Colors.blueGrey)),
+                                    const SizedBox(height: 10),
+                                    if (converted)
+                                      const Text(
+                                        'Already converted — find it under Home → Planned.',
+                                        style: TextStyle(color: Colors.green, fontWeight: FontWeight.w600),
+                                      )
+                                    else
+                                      ElevatedButton.icon(
+                                        onPressed: converting ? null : () => _convertLead(appProvider, map),
+                                        icon: isThisConverting
+                                            ? const SizedBox(
+                                                width: 16,
+                                                height: 16,
+                                                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                                              )
+                                            : const Icon(Icons.transform),
+                                        label: Text(isThisConverting ? 'Converting…' : 'CONVERT TO OUTLET'),
+                                      ),
                                   ],
                                 ),
                               ),
-                            ],
-                          ),
-                          const SizedBox(height: 10),
-                          if (converted)
-                            const Text(
-                              'Already converted — find it under Home → Planned.',
-                              style: TextStyle(color: Colors.green, fontWeight: FontWeight.w600),
-                            )
-                          else
-                            ElevatedButton.icon(
-                              onPressed: converting ? null : () => _convertLead(appProvider, map),
-                              icon: isThisConverting
-                                  ? const SizedBox(
-                                      width: 16,
-                                      height: 16,
-                                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                                    )
-                                  : const Icon(Icons.transform),
-                              label: Text(isThisConverting ? 'Converting…' : 'CONVERT TO OUTLET'),
-                            ),
-                        ],
-                      ),
+                            );
+                          }),
+                      ],
                     ),
-                  );
-                }),
-            ],
+            ),
           ],
         ),
         if (converting)
